@@ -1,0 +1,290 @@
+/***** CONFIG *****/
+const UPDATES_TABLE_NAME = "Profile Updates";
+const PROFILES_TABLE_NAME = "Competitor Profiles";
+
+// "Profile Updates" fields
+const F_PROFILE_LINK        = "Competitor Profile";              // linked to Competitor Profiles (single)
+const F_UPD_EMAIL_YN        = "Update - Personal Email";         // checkbox / single-select / text
+const F_UPD_EMAIL_VALUE     = "Updated Personal Email";
+const F_UPD_PHONE_YN        = "Update Personal Phone Number";
+const F_UPD_PHONE_VALUE     = "Updated Personal Phone Number";
+const F_TEXT_ALERTS_OPTIN   = "Text Alerts OPT IN";              // YES/NO (any type)
+const F_UPD_IG_YN           = "Update Competitor IG";
+const F_UPD_IG_VALUE        = "Updated Competitor IG";
+const F_UPD_STUDIO_NAME_YN  = "Update Studio Name";
+const F_UPD_STUDIO_NAME     = "Updated Studio Name";
+const F_UPD_STUDIO_EMAIL_YN = "Update Studio Email";
+const F_UPD_STUDIO_EMAIL    = "Updated Studio Email";
+const F_UPD_STUDIO_IG_YN    = "Update Studio IG";
+const F_UPD_STUDIO_IG       = "Updated Studio IG";
+
+// NEW: Auth-related fields on "Profile Updates"
+const F_AUTHTOKEN      = "AuthToken";      // value entered on the form
+const F_AUTHENTICATED  = "Authenticated";  // will be set to "AUTHENTICATED" or "MISMATCH"
+
+// "Competitor Profiles" fields
+const P_EMAIL        = "Competitor Email";
+const P_PHONE        = "Competitor Phone Number";
+const P_TEXT_ALERTS  = "Text Alerts OPT IN";
+const P_IG           = "Competitor IG Handle";
+const P_STUDIO_NAME  = "Studio Name";
+const P_STUDIO_EMAIL = "Studio Email";
+const P_STUDIO_IG    = "Studio IG Handle";
+const P_STATUS       = "Status"; // Multi-select expected
+
+// NEW: Auth source field on "Competitor Profiles"
+const P_DOB          = "Date of Birth";
+
+/***** HELPERS *****/
+// Normalize YES/NO from checkbox (bool), single-select ({name}), or strings
+function normalizeYesNo(v) {
+  if (v === true) return "YES";
+  if (v === false) return "NO";
+  if (v && typeof v === "object" && v.name) {
+    const s = String(v.name).trim().toUpperCase();
+    if (["YES","Y","TRUE","OPT IN","OPT-IN","SUBSCRIBE"].includes(s)) return "YES";
+    if (["NO","N","FALSE","OPT OUT","OPT-OUT","UNSUBSCRIBE"].includes(s)) return "NO";
+  }
+  if (Array.isArray(v) && v.length && v[0]?.name) {
+    // if someone used a multi-select for yes/no
+    return normalizeYesNo(v[0]);
+  }
+  if (v != null) {
+    const s = String(v).trim().toUpperCase();
+    if (["YES","Y","TRUE","OPT IN","OPT-IN","SUBSCRIBE"].includes(s)) return "YES";
+    if (["NO","N","FALSE","OPT OUT","OPT-OUT","UNSUBSCRIBE"].includes(s)) return "NO";
+  }
+  return null;
+}
+
+function nonEmptyString(v) {
+  if (v == null) return null;
+  const s = String(v).trim();
+  return s.length ? s : null;
+}
+
+function hasMeaningfulValue(v, disallowPhrase) {
+  const s = nonEmptyString(v);
+  if (!s) return false;
+  if (disallowPhrase && s === disallowPhrase) return false;
+  return true;
+}
+
+// Make a YES/NO value for checkbox or single-select destination fields
+function buildYesNoCellValue(field, yesNo) {
+  if (!yesNo) return undefined;
+  if (field?.type === "checkbox") return yesNo === "YES";
+  if (field?.type === "singleSelect") return { name: yesNo };
+  // fallback: plain text destination
+  return yesNo;
+}
+
+// Replace two mutually-exclusive status tags while preserving everything else
+function replaceStatusPair(existing, includeName, a, b) {
+  const keep = new Set((existing || []).map(x => (typeof x === "string" ? x : x.name)));
+  keep.delete(a); keep.delete(b);
+  if (includeName) keep.add(includeName);
+  return Array.from(keep).map(n => ({ name: n }));
+}
+
+// Add or remove a single status name while preserving others
+function setStatusFlag(existing, name, present) {
+  const keep = new Set((existing || []).map(x => (typeof x === "string" ? x : x.name)));
+  keep.delete(name);
+  if (present) keep.add(name);
+  return Array.from(keep).map(n => ({ name: n }));
+}
+
+// Normalize a date / date-like token into "YYYY-MM-DD" for comparison
+function normalizeDateToken(v) {
+  if (!v) return null;
+
+  // Airtable date field gives a JS Date
+  if (v instanceof Date) {
+    return v.toISOString().slice(0, 10);
+  }
+
+  const s = String(v).trim();
+  if (!s) return null;
+
+  // Try to parse as date first
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) {
+    return d.toISOString().slice(0, 10);
+  }
+
+  // Fallback: raw string; will still match if both are identical strings
+  return s;
+}
+
+/***** MAIN *****/
+const { recordId } = input.config();
+if (!recordId) throw new Error("Missing input variable 'recordId'.");
+
+const updatesTable  = base.getTable(UPDATES_TABLE_NAME);
+const profilesTable = base.getTable(PROFILES_TABLE_NAME);
+
+// Fetch the submitted updates record
+const updateRec = await updatesTable.selectRecordAsync(recordId);
+if (!updateRec) throw new Error(`Could not load Profile Updates record: ${recordId}`);
+
+// Resolve the linked Competitor Profile
+const linked = updateRec.getCellValue(F_PROFILE_LINK);
+if (!linked || !Array.isArray(linked) || linked.length === 0) {
+  throw new Error(`No linked "${F_PROFILE_LINK}" on the updates record.`);
+}
+const profileId = linked[0].id;
+
+// Fetch the competitor profile to read Date of Birth for auth
+const profileRecForAuth = await profilesTable.selectRecordAsync(profileId);
+if (!profileRecForAuth) {
+  throw new Error(`Could not load Competitor Profile record: ${profileId}`);
+}
+
+// AUTH: compare AuthToken (from form) with Date of Birth (from profile)
+const authTokenRaw = updateRec.getCellValue(F_AUTHTOKEN);
+const dobRaw       = profileRecForAuth.getCellValue(P_DOB);
+
+const authTokenNorm = normalizeDateToken(authTokenRaw);
+const dobNorm       = normalizeDateToken(dobRaw);
+
+let authStatus;
+if (authTokenNorm && dobNorm && authTokenNorm === dobNorm) {
+  authStatus = "AUTHENTICATED";
+} else {
+  authStatus = "MISMATCH";
+}
+
+// Write the auth result back to the Profile Updates record
+await updatesTable.updateRecordAsync(recordId, {
+  [F_AUTHENTICATED]: authStatus,
+});
+
+console.log(`Auth check for profile ${profileId}: ${authStatus}`);
+
+// If NOT authenticated, do NOT modify the competitor profile
+if (authStatus !== "AUTHENTICATED") {
+  output.set("profileId", profileId);
+  output.set("changed", "");
+  output.set("message", "Auth token mismatch – Competitor Profile was NOT updated.");
+  // Your automation can branch on {Authenticated} = "MISMATCH" to send the failure email
+  return;
+}
+
+// ====== ONLY REACHES HERE IF AUTHENTICATED ======
+
+// Destination field metadata
+const field_TEXT_ALERTS = profilesTable.getField(P_TEXT_ALERTS);
+const field_STATUS      = profilesTable.getField(P_STATUS);
+
+// Build a single patch of updates
+const patch = {};
+let changed = [];
+
+// Personal Email
+if (normalizeYesNo(updateRec.getCellValue(F_UPD_EMAIL_YN)) === "YES") {
+  const val = nonEmptyString(updateRec.getCellValue(F_UPD_EMAIL_VALUE));
+  patch[P_EMAIL] = val ?? null;
+  changed.push(`${P_EMAIL} -> ${val ?? "CLEARED"}`);
+}
+
+// Personal Phone
+if (normalizeYesNo(updateRec.getCellValue(F_UPD_PHONE_YN)) === "YES") {
+  const val = nonEmptyString(updateRec.getCellValue(F_UPD_PHONE_VALUE));
+  patch[P_PHONE] = val ?? null;
+  changed.push(`${P_PHONE} -> ${val ?? "CLEARED"}`);
+}
+
+// Text Alerts Opt In?
+{
+  const yn = normalizeYesNo(updateRec.getCellValue(F_TEXT_ALERTS_OPTIN));
+  if (yn) {
+    patch[P_TEXT_ALERTS] = buildYesNoCellValue(field_TEXT_ALERTS, yn);
+    changed.push(`${P_TEXT_ALERTS} -> ${yn}`);
+  }
+}
+
+// Competitor IG
+if (normalizeYesNo(updateRec.getCellValue(F_UPD_IG_YN)) === "YES") {
+  const val = nonEmptyString(updateRec.getCellValue(F_UPD_IG_VALUE));
+  patch[P_IG] = val ?? null;
+  changed.push(`${P_IG} -> ${val ?? "CLEARED"}`);
+}
+
+// Studio Name
+if (normalizeYesNo(updateRec.getCellValue(F_UPD_STUDIO_NAME_YN)) === "YES") {
+  const val = nonEmptyString(updateRec.getCellValue(F_UPD_STUDIO_NAME));
+  patch[P_STUDIO_NAME] = val ?? null;
+  changed.push(`${P_STUDIO_NAME} -> ${val ?? "CLEARED"}`);
+}
+
+// Studio Email
+if (normalizeYesNo(updateRec.getCellValue(F_UPD_STUDIO_EMAIL_YN)) === "YES") {
+  const val = nonEmptyString(updateRec.getCellValue(F_UPD_STUDIO_EMAIL));
+  patch[P_STUDIO_EMAIL] = val ?? null;
+  changed.push(`${P_STUDIO_EMAIL} -> ${val ?? "CLEARED"}`);
+}
+
+// Studio IG
+if (normalizeYesNo(updateRec.getCellValue(F_UPD_STUDIO_IG_YN)) === "YES") {
+  const val = nonEmptyString(updateRec.getCellValue(F_UPD_STUDIO_IG));
+  patch[P_STUDIO_IG] = val ?? null;
+  changed.push(`${P_STUDIO_IG} -> ${val ?? "CLEARED"}`);
+}
+
+// Apply updates if any
+if (Object.keys(patch).length > 0) {
+  console.log("Applying updates:", patch);
+  await profilesTable.updateRecordAsync(profileId, patch);
+} else {
+  console.log("No profile fields requested to update (all toggles false/blank).");
+}
+
+// Re-fetch to compute statuses from the latest values
+const profileRec = await profilesTable.selectRecordAsync(profileId);
+
+// Recompute Status
+const currentEmail = profileRec.getCellValue(P_EMAIL);
+const currentPhone = profileRec.getCellValue(P_PHONE);
+const currentIG    = profileRec.getCellValue(P_IG);
+
+const emailGood = hasMeaningfulValue(currentEmail, "Please Update if Applicable");
+const phoneGood = hasMeaningfulValue(currentPhone);
+const igGood    = hasMeaningfulValue(currentIG, "Please Update if Applicable");
+
+const existingStatus = profileRec.getCellValue(P_STATUS) || [];
+
+let nextStatus = replaceStatusPair(
+  existingStatus,
+  emailGood ? "Competitor Email on File" : "No Competitor Email on File",
+  "Competitor Email on File",
+  "No Competitor Email on File"
+);
+nextStatus = replaceStatusPair(
+  nextStatus,
+  phoneGood ? "Competitor Phone Number on File" : "No Competitor Phone Number on File",
+  "Competitor Phone Number on File",
+  "No Competitor Phone Number on File"
+);
+nextStatus = replaceStatusPair(
+  nextStatus,
+  igGood ? "Competitor Instagram Handle on File" : "No Competitor Instagram Handle on File",
+  "Competitor Instagram Handle on File",
+  "No Competitor Instagram Handle on File"
+);
+
+// Toggle "OPTED INTO TEXT ALERTS" tag based on current profile value
+const currentTextAlertsYN = normalizeYesNo(profileRec.getCellValue(P_TEXT_ALERTS));
+nextStatus = setStatusFlag(nextStatus, "OPTED INTO TEXT ALERTS", currentTextAlertsYN === "YES");
+
+// Write Status back
+if (field_STATUS?.type === "multipleSelects") {
+  await profilesTable.updateRecordAsync(profileId, { [P_STATUS]: nextStatus });
+} else if (field_STATUS) {
+  await profilesTable.updateRecordAsync(profileId, { [P_STATUS]: nextStatus.map(o => o.name).join(", ") });
+}
+
+console.log("Changed fields:", changed);
+output.set("profileId", profileId);
+output.set("changed", changed.join(" | "));
+output.set("message", "Competitor Profile updated (AUTHENTICATED; fields patched if toggles were set).");
