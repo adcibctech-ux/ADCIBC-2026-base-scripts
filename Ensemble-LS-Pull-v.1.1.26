@@ -1,0 +1,272 @@
+/***** CONFIG: EDIT THESE FOR EACH CITY RUN *****/
+
+// Source LS city table (change per city)
+const SOURCE_TABLE_NAME = "SEA-LS";          // <-- change to your LS table name
+
+// Destination unified table
+const ENSEMBLES_TABLE_NAME = "Ensembles";
+
+// For this run, what should {Location} be set to in Ensembles? (single select value)
+const DEST_LOCATION_VALUE = "Seattle, WA";   // <-- change to the correct city label for this LS
+
+// SOURCE FIELD NAMES (LS table)
+const F_SRC_ENTRY_ID      = "EntryID";
+const F_SRC_ROUTINE_TITLE = "RoutineTitle";
+const F_SRC_PARTICIPANTS  = "Participants";
+const F_SRC_STUDIO_NAME   = "StudioName";
+const F_SRC_REG_EMAIL     = "RegistrationEmail";  // from LS table
+const F_SRC_CATEGORY      = "Category";           // used to filter Category == "Ensemble"
+const F_SRC_AGE           = "Age";                // numeric field
+
+// DESTINATION FIELD NAMES (Ensembles table)
+const F_DEST_ENTRY_ID       = "EntryID";
+const F_DEST_GROUP_NAME     = "Group Name";
+const F_DEST_PARTICIPANTS   = "Participants";
+const F_DEST_STUDIO_NAME    = "Studio Name";
+const F_DEST_STUDIO_EMAIL   = "Studio Email";
+const F_DEST_ENSEMBLE_TYPE  = "Ensemble Type";      // SINGLE SELECT: "Ensemble", "Pas de Deux", "Duo/Trio"
+const F_DEST_LOCATION       = "Location";           // SINGLE SELECT: city name
+const F_DEST_AGE_DIVISION   = "Age Division";       // SINGLE SELECT: "Primary", "Junior", "Senior"
+
+
+/***** HELPER: chunk array into batches of size n *****/
+function chunkArray(arr, size) {
+    const chunks = [];
+    for (let i = 0; i < arr.length; i += size) {
+        chunks.push(arr.slice(i, i + size));
+    }
+    return chunks;
+}
+
+/***** HELPER: determine Ensemble Type based on participants + routine title *****/
+function determineEnsembleType(participants, routineTitle) {
+    const numParticipants = participants.length;
+    if (numParticipants < 2) {
+        return null; // skip solos / invalid
+    }
+
+    const titleUpper = (routineTitle || "").toString().toUpperCase();
+    const hasPasDeDeuxInTitle = titleUpper.includes("PAS DE DEUX");
+    const hasMale = participants.some(p => p.includes("(M)"));
+
+    // "Pas de Deux" == {Participants} == 2 comma separated values
+    // AND one of the values contains "(M)"
+    // AND {RoutineTitle} contains "PAS DE DEUX"
+    if (numParticipants === 2 && hasMale && hasPasDeDeuxInTitle) {
+        return "Pas de Deux";
+    }
+
+    // "Ensemble" == {Participants} >= 4 comma separated values
+    if (numParticipants >= 4) {
+        return "Ensemble";
+    }
+
+    // "Duo/Trio" == {Participants} is 2 or 3 comma separated values
+    if (numParticipants === 2 || numParticipants === 3) {
+        return "Duo/Trio";
+    }
+
+    return null;
+}
+
+/***** HELPER: determine Age Division from numeric Age *****/
+function determineAgeDivision(ageVal) {
+    if (typeof ageVal !== "number") {
+        return null;
+    }
+
+    if (ageVal >= 9 && ageVal <= 11) {
+        return "Primary";
+    } else if (ageVal >= 12 && ageVal <= 14) {
+        return "Junior";
+    } else if (ageVal >= 15 && ageVal <= 21) {
+        return "Senior";
+    }
+
+    return null; // outside your defined ranges
+}
+
+/***** MAIN SCRIPT *****/
+
+output.markdown(`# Pull Ensembles from **${SOURCE_TABLE_NAME}** → **${ENSEMBLES_TABLE_NAME}**`);
+output.markdown(`Setting **{Location}** to: **${DEST_LOCATION_VALUE}**`);
+
+const srcTable = base.getTable(SOURCE_TABLE_NAME);
+const destTable = base.getTable(ENSEMBLES_TABLE_NAME);
+
+// Load source records
+const srcQuery = await srcTable.selectRecordsAsync({
+    fields: [
+        F_SRC_ENTRY_ID,
+        F_SRC_ROUTINE_TITLE,
+        F_SRC_PARTICIPANTS,
+        F_SRC_STUDIO_NAME,
+        F_SRC_REG_EMAIL,
+        F_SRC_CATEGORY,
+        F_SRC_AGE,              // include Age
+    ],
+});
+
+// Load destination records so we can upsert by EntryID
+const destQuery = await destTable.selectRecordsAsync({
+    fields: [
+        F_DEST_ENTRY_ID,
+        F_DEST_GROUP_NAME,
+        F_DEST_PARTICIPANTS,
+        F_DEST_STUDIO_NAME,
+        F_DEST_STUDIO_EMAIL,
+        F_DEST_ENSEMBLE_TYPE,
+        F_DEST_LOCATION,
+        F_DEST_AGE_DIVISION,    // include Age Division
+    ],
+});
+
+// Build a map: EntryID -> destination record
+const destByEntryId = new Map();
+for (const rec of destQuery.records) {
+    const entryId = rec.getCellValue(F_DEST_ENTRY_ID);
+    if (entryId) {
+        destByEntryId.set(entryId.toString(), rec);
+    }
+}
+
+let totalChecked = 0;
+let totalSkippedEntryDash = 0;
+let totalSkippedCategory = 0;
+let totalSkippedParticipants = 0;
+let totalCreated = 0;
+let totalUpdated = 0;
+
+const createPayload = [];
+const updatePayload = [];
+
+for (const srcRec of srcQuery.records) {
+    totalChecked++;
+
+    const entryId = srcRec.getCellValue(F_SRC_ENTRY_ID);
+    const entryIdStr = entryId ? entryId.toString() : "";
+
+    // Skip if EntryID is missing or "--"
+    if (!entryIdStr || entryIdStr === "--") {
+        totalSkippedEntryDash++;
+        continue;
+    }
+
+    // Only pull routines where {Category} == "Ensemble"
+    const categoryVal = srcRec.getCellValue(F_SRC_CATEGORY);
+    const categoryName = typeof categoryVal === "string"
+        ? categoryVal
+        : (categoryVal && categoryVal.name) || "";
+    if (categoryName !== "Ensemble") {
+        totalSkippedCategory++;
+        continue;
+    }
+
+    // Parse Participants
+    const participantsRaw = srcRec.getCellValue(F_SRC_PARTICIPANTS) || "";
+    const participantsStr = participantsRaw.toString();
+
+    const participants = participantsStr
+        .split(",")
+        .map(p => p.trim())
+        .filter(p => p.length > 0);
+
+    if (participants.length < 2) {
+        // skip solos / invalid
+        totalSkippedParticipants++;
+        continue;
+    }
+
+    const routineTitleRaw = srcRec.getCellValue(F_SRC_ROUTINE_TITLE) || "";
+    const routineTitleStr = routineTitleRaw.toString();
+
+    // Determine Ensemble Type
+    const ensembleTypeName = determineEnsembleType(participants, routineTitleStr);
+    if (!ensembleTypeName) {
+        totalSkippedParticipants++;
+        continue;
+    }
+
+    // Determine Age Division from numeric {Age}
+    const ageVal = srcRec.getCellValue(F_SRC_AGE);   // number or null
+    const ageDivisionName = determineAgeDivision(ageVal);
+
+    const studioName = srcRec.getCellValue(F_SRC_STUDIO_NAME) || "";
+    const regEmail = srcRec.getCellValue(F_SRC_REG_EMAIL) || "";
+
+    // Check if this EntryID already exists in Ensembles
+    const existingDest = destByEntryId.get(entryIdStr);
+
+    const fields = {
+        [F_DEST_ENTRY_ID]: entryIdStr,
+        [F_DEST_GROUP_NAME]: routineTitleStr,
+        [F_DEST_PARTICIPANTS]: participantsStr,
+        [F_DEST_STUDIO_NAME]: studioName,
+        [F_DEST_STUDIO_EMAIL]: regEmail,
+        [F_DEST_ENSEMBLE_TYPE]: { name: ensembleTypeName }, // single select expects an object
+        [F_DEST_LOCATION]: { name: DEST_LOCATION_VALUE },    // single select (city)
+    };
+
+    // Set Age Division if we have a mapping
+    if (ageDivisionName) {
+        fields[F_DEST_AGE_DIVISION] = { name: ageDivisionName };
+    }
+
+    if (existingDest) {
+        // Only push update if something changed
+        const currentTypeObj = existingDest.getCellValue(F_DEST_ENSEMBLE_TYPE);
+        const currentTypeName = currentTypeObj ? currentTypeObj.name : "";
+
+        const currentGroupName = existingDest.getCellValue(F_DEST_GROUP_NAME) || "";
+        const currentParticipants = existingDest.getCellValue(F_DEST_PARTICIPANTS) || "";
+        const currentStudioName = existingDest.getCellValue(F_DEST_STUDIO_NAME) || "";
+        const currentStudioEmail = existingDest.getCellValue(F_DEST_STUDIO_EMAIL) || "";
+        const currentLocationObj = existingDest.getCellValue(F_DEST_LOCATION);
+        const currentLocationName = currentLocationObj ? currentLocationObj.name : "";
+        const currentAgeDivObj = existingDest.getCellValue(F_DEST_AGE_DIVISION);
+        const currentAgeDivName = currentAgeDivObj ? currentAgeDivObj.name : "";
+
+        const desiredAgeDivName = ageDivisionName || "";
+
+        const needsUpdate =
+            currentGroupName.toString() !== routineTitleStr ||
+            currentParticipants.toString() !== participantsStr ||
+            currentStudioName.toString() !== studioName.toString() ||
+            currentStudioEmail.toString() !== regEmail.toString() ||
+            currentTypeName !== ensembleTypeName ||
+            currentLocationName !== DEST_LOCATION_VALUE ||
+            currentAgeDivName !== desiredAgeDivName;
+
+        if (needsUpdate) {
+            updatePayload.push({
+                id: existingDest.id,
+                fields,
+            });
+        }
+    } else {
+        createPayload.push({ fields });
+    }
+}
+
+// Apply creates in batches of 50
+for (const batch of chunkArray(createPayload, 50)) {
+    await destTable.createRecordsAsync(batch);
+    totalCreated += batch.length;
+}
+
+// Apply updates in batches of 50
+for (const batch of chunkArray(updatePayload, 50)) {
+    await destTable.updateRecordsAsync(batch);
+    totalUpdated += batch.length;
+}
+
+output.markdown(`
+**Finished processing from \`${SOURCE_TABLE_NAME}\` to \`${ENSEMBLES_TABLE_NAME}\`.**
+
+- Source records checked: **${totalChecked}**
+- Skipped (EntryID == "--" or missing): **${totalSkippedEntryDash}**
+- Skipped (Category != "Ensemble"): **${totalSkippedCategory}**
+- Skipped (invalid/solo participants or no valid type): **${totalSkippedParticipants}**
+- Records **created** in \`${ENSEMBLES_TABLE_NAME}\`: **${totalCreated}**
+- Records **updated** in \`${ENSEMBLES_TABLE_NAME}\`: **${totalUpdated}**
+`);
