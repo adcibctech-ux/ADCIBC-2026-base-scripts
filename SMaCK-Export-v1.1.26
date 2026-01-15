@@ -1,0 +1,390 @@
+/***** CONFIG: Update names/fields if yours differ *****/
+const CITY_FILTER = "Atlanta, GA"; // ← set to allowed {Location} value or "" to be prompted
+
+// Tables
+const ROSTER_TABLE               = "Regionals Roster";
+const COMP_TABLE                 = "Competitor Profiles";
+const PARENTCOACH_TABLE          = "Parent/Coach Profiles";
+const EXPORT_TABLE               = "SMaCK Export";
+
+// Regionals Roster fields
+const ROSTER_ENTRYID_FIELD       = "EntryID";
+const ROSTER_LOCATION_FIELD      = "Location";                // single select
+const ROSTER_TO_COMP_LINK_FIELD  = "Competitor Profile";      // link → Competitor Profiles
+
+// Competitor Profiles fields
+const COMP_NAME_FIELD            = "Full Name";
+const F_COMP_EMAIL               = "Competitor Email";
+const F_STUDIO_EMAIL             = "Studio Email";
+const COMP_STUDIO_NAME_FIELD     = "Studio Name";             // ✅ per your clarification
+const F_PARENTCOACH_LINK         = "Parent/Coach Profiles";   // link → Parent/Coach Profiles
+
+// Parent/Coach Profiles fields
+const F_PARENTCOACH_EMAIL        = "Parent/Coach Email";
+const F_PARENTCOACH_ROLE         = "Role";                    // single select ("Parent" / "Coach")
+
+// SMaCK Export fields (destination)
+const S_EXPORT_ENTRYID           = "EntryID";
+const S_EXPORT_FULLNAME          = "Full Name";
+const S_EXPORT_AFFILIATION       = "Affiliation";             // single select
+const S_EXPORT_EMAIL             = "Email";
+const S_EXPORT_LOCATION          = "Location";                // single select
+const S_EXPORT_AUTONUMBER        = "Export #";                // for logging tie warnings post-create
+
+// Behavior
+const BATCH_SIZE                 = 50;    // createRecordsAsync batch size
+
+const ALLOWED_LOCATIONS = [
+  "San Francisco, CA","Seattle, WA","Berlin [Germany]","Chicago, IL","Phoenix, AZ",
+  "Atlanta, GA","Toronto, ON [Canada]","Los Angeles, CA","San Diego, CA","Houston, TX",
+  "Pittsburgh, PA","Raleigh, NC","Dallas, TX","Denver, CO","Orlando, FL"
+];
+
+/***** Helpers *****/
+const EMAIL_RE = /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i;
+const BAD_PLACEHOLDER = "Please Update If Applicable";
+
+function normalizeEmail(v) {
+  return (v ?? "").toString().trim().toLowerCase();
+}
+function isGoodEmail(v) {
+  if (!v) return false;
+  const s = String(v).trim();
+  if (!s || s === BAD_PLACEHOLDER) return false;
+  return EMAIL_RE.test(s);
+}
+function cleanEmails(values) {
+  const out = [];
+  const seen = new Set();
+  for (const v of (values || [])) {
+    const raw = (typeof v === "string" ? v.trim() : "");
+    if (!isGoodEmail(raw)) continue;
+    const norm = normalizeEmail(raw);
+    if (seen.has(norm)) continue;
+    seen.add(norm);
+    out.push(raw.trim()); // keep original casing
+  }
+  return out;
+}
+function nonEmptyStringOrNull(v) {
+  const s = (v ?? "").toString().trim();
+  return s ? s : null;
+}
+function getFirstLinkedId(cellValue) {
+  return Array.isArray(cellValue) && cellValue.length > 0 ? cellValue[0].id : null;
+}
+function getAllLinkedIds(cellValue) {
+  return Array.isArray(cellValue) ? cellValue.map(x => x.id) : [];
+}
+
+// Priority: Parent > Competitor > Coach > Studio
+const AFF_PRIORITY = {
+  Parent: 4,
+  Competitor: 3,
+  Coach: 2,
+  Studio: 1
+};
+
+function roleToAffiliation(roleCell) {
+  const roleName = roleCell?.name || (roleCell ?? "").toString();
+  const rl = (roleName || "").trim().toLowerCase();
+  if (rl === "parent") return "Parent";
+  if (rl === "coach") return "Coach";
+  // Default bucket (matches your prior script behavior)
+  return "Parent";
+}
+
+/**
+ * Choose "most frequent" studio name for an email.
+ * Returns: { chosenName, isTie, candidates }
+ */
+function pickMostFrequentName(names) {
+  const counts = new Map();
+  for (const n of names) {
+    const s = (n ?? "").toString().trim();
+    if (!s) continue;
+    counts.set(s, (counts.get(s) || 0) + 1);
+  }
+  if (counts.size === 0) return { chosenName: null, isTie: false, candidates: [] };
+
+  let max = -1;
+  for (const v of counts.values()) max = Math.max(max, v);
+
+  const top = [];
+  for (const [k, v] of counts.entries()) {
+    if (v === max) top.push(k);
+  }
+  top.sort((a, b) => a.localeCompare(b)); // deterministic tie-break
+
+  return { chosenName: top[0], isTie: top.length > 1, candidates: top };
+}
+
+/***** Main *****/
+async function main() {
+  // Resolve city filter
+  let city = CITY_FILTER;
+  if (!city) {
+    city = await input.buttonsAsync("Pick a Location to export:", ALLOWED_LOCATIONS);
+  }
+  if (!ALLOWED_LOCATIONS.includes(city)) {
+    throw new Error(`CITY_FILTER "${city}" is not in allowed list. Update CONFIG or choose a valid value.`);
+  }
+
+  const rosterTbl = base.getTable(ROSTER_TABLE);
+  const compTbl   = base.getTable(COMP_TABLE);
+  const pcTbl     = base.getTable(PARENTCOACH_TABLE);
+  const exportTbl = base.getTable(EXPORT_TABLE);
+
+  // Preload needed fields
+  const rosterQuery = await rosterTbl.selectRecordsAsync({
+    fields: [ROSTER_ENTRYID_FIELD, ROSTER_LOCATION_FIELD, ROSTER_TO_COMP_LINK_FIELD]
+  });
+  const compQuery = await compTbl.selectRecordsAsync({
+    fields: [COMP_NAME_FIELD, F_COMP_EMAIL, F_STUDIO_EMAIL, COMP_STUDIO_NAME_FIELD, F_PARENTCOACH_LINK]
+  });
+  const pcQuery = await pcTbl.selectRecordsAsync({
+    fields: [F_PARENTCOACH_EMAIL, F_PARENTCOACH_ROLE]
+  });
+
+  // Filter roster by chosen city
+  const rosterInCity = rosterQuery.records.filter(r => {
+    const locName = r.getCellValue(ROSTER_LOCATION_FIELD)?.name || r.getCellValueAsString(ROSTER_LOCATION_FIELD);
+    return locName === city;
+  });
+
+  // emailKey -> best winner info
+  // We store enough to later render the correct export row for that email.
+  const winnersByEmail = new Map();
+
+  // For studio emails only: track studioName candidates (for "most frequent") and fallback competitor name
+  // studioEmailKey -> { studioNames: [], fallbackCompetitorNames: [] }
+  const studioMetaByEmail = new Map();
+
+  // Logging
+  const noValidEmail = []; // {entryId, name}
+  const badStudioEmailNoName = []; // debug bucket if needed
+
+  // Candidate ingestion helper:
+  function considerCandidate({
+    emailRaw,
+    affiliation,           // "Parent"|"Competitor"|"Coach"|"Studio"
+    entryId,
+    personName,            // competitor full name (or parent/coach name if you had one; here it's competitor name)
+    studioName,            // if applicable
+  }) {
+    if (!isGoodEmail(emailRaw)) return;
+    const emailKey = normalizeEmail(emailRaw);
+
+    // Track studio metadata for later (most frequent Studio Name)
+    if (affiliation === "Studio") {
+      if (!studioMetaByEmail.has(emailKey)) {
+        studioMetaByEmail.set(emailKey, { studioNames: [], fallbackCompetitorNames: [] });
+      }
+      const meta = studioMetaByEmail.get(emailKey);
+      if (studioName) meta.studioNames.push(studioName);
+      if (personName) meta.fallbackCompetitorNames.push(personName);
+    }
+
+    const existing = winnersByEmail.get(emailKey);
+    if (!existing) {
+      winnersByEmail.set(emailKey, {
+        emailRaw: emailRaw.trim(),
+        affiliation,
+        entryId,
+        personName: personName || null
+      });
+      return;
+    }
+
+    const currPri = AFF_PRIORITY[existing.affiliation] || 0;
+    const nextPri = AFF_PRIORITY[affiliation] || 0;
+
+    // Higher priority wins; if equal priority, keep existing (deterministic)
+    if (nextPri > currPri) {
+      winnersByEmail.set(emailKey, {
+        emailRaw: emailRaw.trim(),
+        affiliation,
+        entryId,
+        personName: personName || existing.personName || null
+      });
+    }
+  }
+
+  // Walk roster
+  for (const rosterRec of rosterInCity) {
+    const entryId = rosterRec.getCellValueAsString(ROSTER_ENTRYID_FIELD);
+    const compId  = getFirstLinkedId(rosterRec.getCellValue(ROSTER_TO_COMP_LINK_FIELD));
+
+    if (!entryId || !compId) {
+      noValidEmail.push({ entryId: entryId || "(missing EntryID)", name: "(no competitor linked)" });
+      continue;
+    }
+
+    const compRec = compQuery.getRecord(compId);
+    if (!compRec) {
+      noValidEmail.push({ entryId, name: "(competitor record not found)" });
+      continue;
+    }
+
+    const competitorName =
+      nonEmptyStringOrNull(compRec.getCellValueAsString(COMP_NAME_FIELD)) || "(Unnamed Competitor)";
+
+    const compEmailRaw   = compRec.getCellValueAsString(F_COMP_EMAIL);
+    const studioEmailRaw = compRec.getCellValueAsString(F_STUDIO_EMAIL);
+    const studioNameRaw  = nonEmptyStringOrNull(compRec.getCellValueAsString(COMP_STUDIO_NAME_FIELD));
+
+    // Parent/Coach
+    const pcIds = getAllLinkedIds(compRec.getCellValue(F_PARENTCOACH_LINK));
+    for (const pcId of pcIds) {
+      const pcRec = pcQuery.getRecord(pcId);
+      if (!pcRec) continue;
+
+      const pcEmailRaw = pcRec.getCellValueAsString(F_PARENTCOACH_EMAIL);
+      const aff = roleToAffiliation(pcRec.getCellValue(F_PARENTCOACH_ROLE));
+
+      for (const e of cleanEmails([pcEmailRaw])) {
+        considerCandidate({
+          emailRaw: e,
+          affiliation: aff,
+          entryId,
+          personName: competitorName
+        });
+      }
+    }
+
+    // Competitor email
+    for (const e of cleanEmails([compEmailRaw])) {
+      considerCandidate({
+        emailRaw: e,
+        affiliation: "Competitor",
+        entryId,
+        personName: competitorName
+      });
+    }
+
+    // Studio email
+    for (const e of cleanEmails([studioEmailRaw])) {
+      considerCandidate({
+        emailRaw: e,
+        affiliation: "Studio",
+        entryId,
+        personName: competitorName,
+        studioName: studioNameRaw
+      });
+    }
+  }
+
+  // Build export rows from winners
+  const toCreate = [];
+  const studioTieWarnings = []; // { emailKey, candidates, recordIdAfterCreate? }
+
+  for (const [emailKey, win] of winnersByEmail.entries()) {
+    const aff = win.affiliation;
+    const emailOut = win.emailRaw;
+
+    if (aff === "Studio") {
+      const meta = studioMetaByEmail.get(emailKey) || { studioNames: [], fallbackCompetitorNames: [] };
+      const pick = pickMostFrequentName(meta.studioNames);
+
+      let fullName = pick.chosenName;
+      if (!fullName) {
+        // fallback on competitor name (most recent we saw, or any from meta)
+        fullName = win.personName || meta.fallbackCompetitorNames[0] || "(Unnamed)";
+        badStudioEmailNoName.push({ email: emailOut, fallbackUsed: fullName });
+      }
+
+      // tie tracking (so we can log Export # after create)
+      if (pick.isTie) {
+        studioTieWarnings.push({
+          emailKey,
+          emailOut,
+          candidates: pick.candidates
+        });
+      }
+
+      toCreate.push({
+        fields: {
+          [S_EXPORT_ENTRYID]: "--",
+          [S_EXPORT_FULLNAME]: fullName,
+          [S_EXPORT_AFFILIATION]: { name: "Studio" },
+          [S_EXPORT_EMAIL]: emailOut,
+          [S_EXPORT_LOCATION]: { name: city }
+        },
+        _meta: { emailKey } // local meta for post-create mapping
+      });
+    } else {
+      // Parent/Competitor/Coach rows
+      toCreate.push({
+        fields: {
+          [S_EXPORT_ENTRYID]: win.entryId,
+          [S_EXPORT_FULLNAME]: win.personName || "(Unnamed)",
+          [S_EXPORT_AFFILIATION]: { name: aff },
+          [S_EXPORT_EMAIL]: emailOut,
+          [S_EXPORT_LOCATION]: { name: city }
+        },
+        _meta: { emailKey }
+      });
+    }
+  }
+
+  // Create in batches and capture created record IDs (for tie warning Export # lookup)
+  const createdIdsByEmailKey = new Map();
+  let createdCount = 0;
+
+  for (let i = 0; i < toCreate.length; i += BATCH_SIZE) {
+    const batch = toCreate.slice(i, i + BATCH_SIZE);
+    const payload = batch.map(x => ({ fields: x.fields }));
+
+    const created = await exportTbl.createRecordsAsync(payload);
+    createdCount += created.length;
+
+    // createRecordsAsync returns record IDs in order
+    for (let j = 0; j < created.length; j++) {
+      const emailKey = batch[j]._meta.emailKey;
+      createdIdsByEmailKey.set(emailKey, created[j]);
+    }
+  }
+
+  // Post-create: log tie warnings with Export #
+  if (studioTieWarnings.length > 0) {
+    const ids = studioTieWarnings
+      .map(w => createdIdsByEmailKey.get(w.emailKey))
+      .filter(Boolean);
+
+    if (ids.length > 0) {
+      const createdRecs = await exportTbl.selectRecordsAsync({
+        fields: [S_EXPORT_AUTONUMBER, S_EXPORT_EMAIL, S_EXPORT_AFFILIATION, S_EXPORT_FULLNAME, S_EXPORT_LOCATION]
+      });
+
+      const byId = new Map(createdRecs.records.map(r => [r.id, r]));
+
+      for (const w of studioTieWarnings) {
+        const recId = createdIdsByEmailKey.get(w.emailKey);
+        const rec = recId ? byId.get(recId) : null;
+        const exportNum = rec ? rec.getCellValueAsString(S_EXPORT_AUTONUMBER) : "(unknown Export #)";
+
+        console.warn(
+          `[Studio Name Tie] Export # ${exportNum} | Email: ${w.emailOut} | Candidates (same frequency): ${w.candidates.join(" | ")}`
+        );
+      }
+    } else {
+      console.warn("[Studio Name Tie] Detected ties, but could not resolve created record IDs for logging Export #.");
+    }
+  }
+
+  // Summary
+  output.markdown(
+    `### SMaCK Export — City-Level Unique Email Export Complete\n` +
+    `- **Location:** ${city}\n` +
+    `- **Roster records in location:** ${rosterInCity.length}\n` +
+    `- **Unique emails exported:** ${createdCount}\n` +
+    `- **Competitors with missing roster linkage:** ${noValidEmail.length}\n` +
+    (studioTieWarnings.length ? `- **Studio emails with Studio Name frequency ties:** ${studioTieWarnings.length} (see console warnings)\n` : "")
+  );
+
+  if (noValidEmail.length > 0) {
+    output.markdown(`#### Missing roster linkage / competitor record (EntryID → Name)\n${noValidEmail.map(x => `- ${x.entryId} → ${x.name}`).join("\n")}`);
+  }
+}
+
+await main();
