@@ -1,0 +1,259 @@
+/***** CONFIG: Update names/fields if yours differ *****/
+const CITY_FILTER = "Atlanta, GA"; // ← set to one of the allowed {Location} values or "" to be prompted
+
+// Tables
+const ROSTER_TABLE               = "Regionals Roster";
+const COMP_TABLE                 = "Competitor Profiles";
+const PARENTCOACH_TABLE          = "Parent/Coach Profiles";
+const EXPORT_TABLE               = "SMaCK Export";
+
+// Regionals Roster fields
+const ROSTER_ENTRYID_FIELD       = "EntryID";
+const ROSTER_LOCATION_FIELD      = "Location";                // single select
+const ROSTER_TO_COMP_LINK_FIELD  = "Competitor Profile";      // link → Competitor Profiles
+
+// Competitor Profiles fields
+const COMP_NAME_FIELD            = "Full Name";
+const F_COMP_EMAIL               = "Competitor Email";
+const F_STUDIO_EMAIL             = "Studio Email";
+const F_PARENTCOACH_LINK         = "Parent/Coach Profiles";   // link → Parent/Coach Profiles
+
+// Parent/Coach Profiles fields
+const F_PARENTCOACH_EMAIL        = "Parent/Coach Email";
+const F_PARENTCOACH_ROLE         = "Role";                    // single select ("Parent" / "Coach")
+
+// SMaCK Export fields (destination)
+const S_EXPORT_ENTRYID           = "EntryID";
+const S_EXPORT_FULLNAME          = "Full Name";
+const S_EXPORT_AFFILIATION       = "Affiliation";             // single select
+const S_EXPORT_EMAIL             = "Email";
+const S_EXPORT_LOCATION          = "Location";                // single select
+
+// Behavior toggles
+const ENABLE_SKIP_EXISTING       = true;  // if true, don't create duplicates already in SMaCK Export
+const BATCH_SIZE                 = 50;    // createRecordsAsync batch size
+
+const ALLOWED_LOCATIONS = [
+  "San Francisco, CA","Seattle, WA","Berlin [Germany]","Chicago, IL","Phoenix, AZ",
+  "Atlanta, GA","Toronto, ON [Canada]","Los Angeles, CA","San Diego, CA","Houston, TX",
+  "Pittsburgh, PA","Raleigh, NC","Dallas, TX","Denver, CO","Orlando, FL"
+];
+
+/***** Helpers *****/
+const EMAIL_RE = /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i;
+const BAD_PLACEHOLDER = "Please Update If Applicable";
+
+const unique = (arr) => Array.from(new Set(arr));
+
+function isGoodEmail(v) {
+  if (!v) return false;
+  const s = String(v).trim();
+  if (!s || s === BAD_PLACEHOLDER) return false;
+  return EMAIL_RE.test(s);
+}
+function cleanEmails(values) {
+  return unique((values || [])
+    .map(v => (typeof v === "string" ? v.trim() : ""))
+    .filter(isGoodEmail)
+  );
+}
+function nonEmptyStringOrNull(v) {
+  const s = (v ?? "").toString().trim();
+  return s ? s : null;
+}
+function getFirstLinkedId(cellValue) {
+  return Array.isArray(cellValue) && cellValue.length > 0 ? cellValue[0].id : null;
+}
+function getAllLinkedIds(cellValue) {
+  return Array.isArray(cellValue) ? cellValue.map(x => x.id) : [];
+}
+
+/***** Main *****/
+async function main() {
+  // Resolve city filter
+  let city = CITY_FILTER;
+  if (!city) {
+    city = await input.buttonsAsync("Pick a Location to export:", ALLOWED_LOCATIONS);
+  }
+  if (!ALLOWED_LOCATIONS.includes(city)) {
+    throw new Error(`CITY_FILTER "${city}" is not in allowed list. Update CONFIG or choose a valid value.`);
+  }
+
+  const rosterTbl = base.getTable(ROSTER_TABLE);
+  const compTbl   = base.getTable(COMP_TABLE);
+  const pcTbl     = base.getTable(PARENTCOACH_TABLE);
+  const exportTbl = base.getTable(EXPORT_TABLE);
+
+  // Preload needed fields
+  const rosterQuery = await rosterTbl.selectRecordsAsync({
+    fields: [ROSTER_ENTRYID_FIELD, ROSTER_LOCATION_FIELD, ROSTER_TO_COMP_LINK_FIELD]
+  });
+  const compQuery = await compTbl.selectRecordsAsync({
+    fields: [COMP_NAME_FIELD, F_COMP_EMAIL, F_STUDIO_EMAIL, F_PARENTCOACH_LINK]
+  });
+  const pcQuery = await pcTbl.selectRecordsAsync({
+    fields: [F_PARENTCOACH_EMAIL, F_PARENTCOACH_ROLE]
+  });
+
+  // Optionally load existing export rows to skip duplicates
+  let existingKeySet = new Set();
+  if (ENABLE_SKIP_EXISTING) {
+    const exportQuery = await exportTbl.selectRecordsAsync({
+      fields: [S_EXPORT_ENTRYID, S_EXPORT_AFFILIATION, S_EXPORT_EMAIL, S_EXPORT_LOCATION]
+    });
+    for (const r of exportQuery.records) {
+      const affName = r.getCellValue(S_EXPORT_AFFILIATION)?.name || "";
+      const locName = r.getCellValue(S_EXPORT_LOCATION)?.name || "";
+      const k = `${r.getCellValueAsString(S_EXPORT_ENTRYID)}|${affName}|${r.getCellValueAsString(S_EXPORT_EMAIL)}|${locName}`.toLowerCase();
+      existingKeySet.add(k);
+    }
+  }
+
+  // Filter roster by chosen city
+  const rosterInCity = rosterQuery.records.filter(r => {
+    const locName = r.getCellValue(ROSTER_LOCATION_FIELD)?.name || r.getCellValueAsString(ROSTER_LOCATION_FIELD);
+    return locName === city;
+  });
+
+  let toCreate = [];
+  let noValidEmail = []; // {entryId, name}
+
+  for (const rosterRec of rosterInCity) {
+    const entryId = rosterRec.getCellValueAsString(ROSTER_ENTRYID_FIELD);
+    const compId  = getFirstLinkedId(rosterRec.getCellValue(ROSTER_TO_COMP_LINK_FIELD));
+
+    if (!entryId || !compId) {
+      noValidEmail.push({ entryId: entryId || "(missing EntryID)", name: "(no competitor linked)" });
+      continue;
+    }
+
+    const compRec = compQuery.getRecord(compId);
+    if (!compRec) {
+      noValidEmail.push({ entryId, name: "(competitor record not found)" });
+      continue;
+    }
+
+    const fullName = nonEmptyStringOrNull(compRec.getCellValueAsString(COMP_NAME_FIELD)) || "(Unnamed Competitor)";
+
+    // Emails
+    const compEmail   = compRec.getCellValueAsString(F_COMP_EMAIL);
+    const studioEmail = compRec.getCellValueAsString(F_STUDIO_EMAIL);
+
+    // Parent/Coach emails via links
+    const pcIds = getAllLinkedIds(compRec.getCellValue(F_PARENTCOACH_LINK));
+    let parentEmails = [];
+    let coachEmails  = [];
+
+    for (const pcId of pcIds) {
+      const pcRec = pcQuery.getRecord(pcId);
+      if (!pcRec) continue;
+      const pcEmail = pcRec.getCellValueAsString(F_PARENTCOACH_EMAIL);
+      const role    = pcRec.getCellValue(F_PARENTCOACH_ROLE)?.name || pcRec.getCellValueAsString(F_PARENTCOACH_ROLE) || "";
+
+      for (const e of cleanEmails([pcEmail])) {
+        const rl = role.toLowerCase();
+        if (rl === "parent") parentEmails.push(e);
+        else if (rl === "coach") coachEmails.push(e);
+        else parentEmails.push(e); // default bucket
+      }
+    }
+
+    // Build candidate rows (note: single-selects require {name: "..."} objects)
+    const candidateRows = [];
+
+    // Competitor
+    for (const e of cleanEmails([compEmail])) {
+      candidateRows.push({
+        [S_EXPORT_ENTRYID]: entryId,
+        [S_EXPORT_FULLNAME]: fullName,
+        [S_EXPORT_AFFILIATION]: { name: "Competitor" },
+        [S_EXPORT_EMAIL]: e,
+        [S_EXPORT_LOCATION]: { name: city }
+      });
+    }
+    // Studio
+    for (const e of cleanEmails([studioEmail])) {
+      candidateRows.push({
+        [S_EXPORT_ENTRYID]: entryId,
+        [S_EXPORT_FULLNAME]: fullName,
+        [S_EXPORT_AFFILIATION]: { name: "Studio" },
+        [S_EXPORT_EMAIL]: e,
+        [S_EXPORT_LOCATION]: { name: city }
+      });
+    }
+    // Parent
+    for (const e of unique(parentEmails)) {
+      candidateRows.push({
+        [S_EXPORT_ENTRYID]: entryId,
+        [S_EXPORT_FULLNAME]: fullName,
+        [S_EXPORT_AFFILIATION]: { name: "Parent" },
+        [S_EXPORT_EMAIL]: e,
+        [S_EXPORT_LOCATION]: { name: city }
+      });
+    }
+    // Coach
+    for (const e of unique(coachEmails)) {
+      candidateRows.push({
+        [S_EXPORT_ENTRYID]: entryId,
+        [S_EXPORT_FULLNAME]: fullName,
+        [S_EXPORT_AFFILIATION]: { name: "Coach" },
+        [S_EXPORT_EMAIL]: e,
+        [S_EXPORT_LOCATION]: { name: city }
+      });
+    }
+
+    // De-dupe within this competitor by (Affiliation name + Email)
+    const seen = new Set();
+    const deduped = candidateRows.filter(r => {
+      const aff = r[S_EXPORT_AFFILIATION]?.name || "";
+      const k = `${aff}|${r[S_EXPORT_EMAIL]}`.toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+
+    if (deduped.length === 0) {
+      noValidEmail.push({ entryId, name: fullName });
+      continue;
+    }
+
+    // Optionally skip rows already present in SMaCK Export
+    if (ENABLE_SKIP_EXISTING) {
+      for (const fields of deduped) {
+        const key = `${fields[S_EXPORT_ENTRYID]}|${fields[S_EXPORT_AFFILIATION]?.name}|${fields[S_EXPORT_EMAIL]}|${fields[S_EXPORT_LOCATION]?.name}`.toLowerCase();
+        if (!existingKeySet.has(key)) {
+          toCreate.push({ fields });
+        }
+      }
+    } else {
+      toCreate.push(...deduped.map(fields => ({ fields })));
+    }
+  }
+
+  // Create in batches
+  let createdCount = 0;
+  for (let i = 0; i < toCreate.length; i += BATCH_SIZE) {
+    const batch = toCreate.slice(i, i + BATCH_SIZE);
+    await exportTbl.createRecordsAsync(batch);
+    createdCount += batch.length;
+  }
+
+  // Summary
+  const totalRoster = rosterInCity.length;
+  const flagged = noValidEmail.length;
+
+  output.markdown(
+    `### SMaCK Export — Bulk Build Complete\n` +
+    `- **Location:** ${city}\n` +
+    `- **Roster records in location:** ${totalRoster}\n` +
+    `- **Rows created in SMaCK Export:** ${createdCount}\n` +
+    `- **Competitors with *no valid emails*:** ${flagged}\n`
+  );
+
+  if (flagged > 0) {
+    output.markdown(`#### Missing email coverage (EntryID → Name)
+${noValidEmail.map(x => `- ${x.entryId} → ${x.name}`).join("\n")}`);
+  }
+}
+
+await main();
