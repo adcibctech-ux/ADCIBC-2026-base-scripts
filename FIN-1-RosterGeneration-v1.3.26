@@ -1,5 +1,5 @@
 /**
- * FIN-1-RosterGeneration-v1.2.26
+ * FIN-1-RosterGeneration-v1.3.26
  * FINALS LS -> Build/update FINALS ROSTER + link Competitor Profiles + link supporting records
  *
  * BUG FIXES:
@@ -8,6 +8,8 @@
  * - Writes {Competitor Profile} to Finals Scholarship Book when blank.
  * - Writes {Competitor Profiles} to Ensembles when participant matches are found.
  * - Updates {Competitor Type} on existing Competitor Profiles as well as newly created ones.
+ * - Scholarship Book name matching now allows Finals LS names without middle names to match Scholarship names with middle names,
+ *   as long as first and last name match.
  *
  * BEHAVIOR:
  * - Bulk execution script for Airtable Scripting Extension.
@@ -299,6 +301,29 @@ function isMaleScholarshipMatchAllowed(finalsLsName, scholarshipSex) {
     return normalizeWhitespace(scholarshipSex).toLowerCase() === CFG.VALUES.SEX.MALE.toLowerCase();
 }
 
+function getNamePartsForCompare(value) {
+    const parts = normalizeCompareName(value).split(" ").filter(Boolean);
+    return parts;
+}
+
+function namesMatchAllowingMiddle(finalsLsName, otherName) {
+    const a = getNamePartsForCompare(finalsLsName);
+    const b = getNamePartsForCompare(otherName);
+
+    if (!a.length || !b.length) return false;
+
+    const aExact = a.join(" ");
+    const bExact = b.join(" ");
+    if (aExact === bExact) return true;
+
+    const aFirst = a[0];
+    const aLast = a[a.length - 1];
+    const bFirst = b[0];
+    const bLast = b[b.length - 1];
+
+    return aFirst === bFirst && aLast === bLast;
+}
+
 ////////////////////////////////////////
 // LOAD TABLES
 ////////////////////////////////////////
@@ -315,7 +340,7 @@ const ensemblesTable = assertTable(base, CFG.TABLES.ENSEMBLES);
 // LOAD RECORDS
 ////////////////////////////////////////
 
-output.markdown(`### FIN-1-RosterGeneration-v1.2.26`);
+output.markdown(`### FIN-1-RosterGeneration-v1.3.26`);
 output.text("Loading records...");
 
 const [
@@ -598,7 +623,7 @@ for (const person of competitorMap.values()) {
         const normalizedNameCandidates = candidatesById.filter(r => {
             const scholarshipName = normalizeWhitespace(r.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.FULL_NAME));
             const scholarshipSex = normalizeWhitespace(r.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.SEX));
-            return normalizeCompareName(scholarshipName) === compareName
+            return namesMatchAllowingMiddle(person.fullName, scholarshipName)
                 && isMaleScholarshipMatchAllowed(person.fullName, scholarshipSex);
         });
 
@@ -606,7 +631,7 @@ for (const person of competitorMap.values()) {
             matchedScholarship = normalizedNameCandidates[0];
         } else if (normalizedNameCandidates.length > 1) {
             person.buildStatus = CFG.VALUES.BUILD_STATUS.REVIEW;
-            person.buildNotes = appendNote(person.buildNotes, "Multiple Scholarship Book matches by EntryID + normalized Full Name.");
+            person.buildNotes = appendNote(person.buildNotes, "Multiple Scholarship Book matches by EntryID + normalized/first-last Full Name.");
             console.log(`REVIEW: Multiple Scholarship Book matches for soloist ${person.fullName} (${person.baseEntryId})`);
         } else if (candidatesById.length) {
             const candidateSummary = candidatesById.map(r => {
@@ -617,7 +642,7 @@ for (const person of competitorMap.values()) {
             person.buildStatus = CFG.VALUES.BUILD_STATUS.ID_CONFLICT;
             person.buildNotes = appendNote(
                 person.buildNotes,
-                `Scholarship Book EntryID matched but normalized name/sex validation failed. Scholarship candidates: ${candidateSummary.join(", ")}`
+                `Scholarship Book EntryID matched but name/sex validation failed. Scholarship candidates: ${candidateSummary.join(", ")}`
             );
             console.log(`REVIEW: Scholarship EntryID/name mismatch for ${person.fullName} (${person.baseEntryId})`);
         }
@@ -629,8 +654,20 @@ for (const person of competitorMap.values()) {
             return isMaleScholarshipMatchAllowed(person.fullName, scholarshipSex);
         });
 
-        if (exactCompareMatches.length === 1) {
-            matchedScholarship = exactCompareMatches[0];
+        let middleNameAllowedMatches = exactCompareMatches;
+
+        if (!middleNameAllowedMatches.length) {
+            const broaderCandidates = scholarshipQuery.records.filter(r => {
+                const scholarshipName = normalizeWhitespace(r.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.FULL_NAME));
+                const scholarshipSex = normalizeWhitespace(r.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.SEX));
+                return namesMatchAllowingMiddle(person.fullName, scholarshipName)
+                    && isMaleScholarshipMatchAllowed(person.fullName, scholarshipSex);
+            });
+            middleNameAllowedMatches = broaderCandidates;
+        }
+
+        if (middleNameAllowedMatches.length === 1) {
+            matchedScholarship = middleNameAllowedMatches[0];
 
             if (person.competitorType === CFG.VALUES.COMPETITOR_TYPE.SOLOIST && person.baseEntryId) {
                 const scholarshipEntryId = normalizeSoloistEntryId(
@@ -640,17 +677,17 @@ for (const person of competitorMap.values()) {
                     person.buildStatus = CFG.VALUES.BUILD_STATUS.ID_CONFLICT;
                     person.buildNotes = appendNote(
                         person.buildNotes,
-                        `Normalized name matched Scholarship Book but EntryIDs differ: Finals LS ${person.baseEntryId}, Scholarship ${scholarshipEntryId}`
+                        `Name matched Scholarship Book but EntryIDs differ: Finals LS ${person.baseEntryId}, Scholarship ${scholarshipEntryId}`
                     );
                     console.log(`REVIEW: Same-name different-ID conflict for ${person.fullName}`);
                 }
             }
-        } else if (exactCompareMatches.length > 1) {
+        } else if (middleNameAllowedMatches.length > 1) {
             person.buildStatus =
                 person.buildStatus === CFG.VALUES.BUILD_STATUS.OK
                     ? CFG.VALUES.BUILD_STATUS.REVIEW
                     : person.buildStatus;
-            person.buildNotes = appendNote(person.buildNotes, "Multiple Scholarship Book matches by normalized Full Name.");
+            person.buildNotes = appendNote(person.buildNotes, "Multiple Scholarship Book matches by normalized/first-last Full Name.");
             console.log(`REVIEW: Multiple Scholarship Book name matches for ${person.fullName}`);
         }
     }
@@ -1097,7 +1134,7 @@ output.text(`Ensemble only: ${ensembleOnlyCount}`);
 output.text(`Records flagged for review: ${reviewCount}`);
 output.text(`Profiles still unresolved after run: ${unresolvedProfileCount}`);
 
-console.log("FIN-1-RosterGeneration-v1.2.26 completed.");
+console.log("FIN-1-RosterGeneration-v1.3.26 completed.");
 console.log(`Processed competitors: ${competitorMap.size}`);
 console.log(`Soloists: ${soloistCount}`);
 console.log(`Ensemble only: ${ensembleOnlyCount}`);
