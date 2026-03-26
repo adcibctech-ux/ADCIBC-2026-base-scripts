@@ -1,9 +1,12 @@
 /**
- * FIN-1-RosterGeneration-v1.0.26
+ * FIN-1-RosterGeneration-v1.1.26
  * FINALS LS -> Build/update FINALS ROSTER + link Competitor Profiles + link supporting records
  *
  * BUG FIXES:
- * - N/A
+ * - Ignore blank incoming {Age Division} values when evaluating age-division conflicts.
+ * - Write Competitor Profiles {Status} as a multi-select array.
+ * - Improve scholarship/profile matching normalization to reduce false mismatch flags.
+ * - For Finals LS names ending in "(M)", confirm Finals Scholarship Book {Sex} == "Male" before treating the scholarship match as valid.
  *
  * BEHAVIOR:
  * - Bulk execution script for Airtable Scripting Extension.
@@ -72,6 +75,7 @@ const CFG = {
             ENTRY_ID: "EntryID",
             FULL_NAME: "Full Name",
             DOB: "DOB",
+            SEX: "Sex",
             COMPETITOR_PROFILE: "Competitor Profile",
         },
 
@@ -136,6 +140,10 @@ const CFG = {
         PROFILE_STATUS: {
             NEW: "NEW",
         },
+
+        SEX: {
+            MALE: "Male",
+        },
     },
 
     BATCH_SIZE: 50,
@@ -149,20 +157,33 @@ const CFG = {
 
 function assertTable(base, tableName) {
     const table = base.getTable(tableName);
-    if (!table) {
-        throw new Error(`Missing table: ${tableName}`);
-    }
+    if (!table) throw new Error(`Missing table: ${tableName}`);
     return table;
 }
 
 function normalizeWhitespace(value) {
-    return String(value || "")
-        .replace(/\s+/g, " ")
-        .trim();
+    return String(value || "").replace(/\s+/g, " ").trim();
 }
 
 function normalizeName(value) {
     return normalizeWhitespace(value).toLowerCase();
+}
+
+function stripMaleSuffixForCompare(value) {
+    return normalizeWhitespace(value).replace(/\(M\)$/i, "").trim();
+}
+
+function normalizeCompareName(value) {
+    return stripMaleSuffixForCompare(value)
+        .toLowerCase()
+        .replace(/[’']/g, "")
+        .replace(/[().,]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function nameHasMaleSuffix(value) {
+    return /\(M\)$/i.test(normalizeWhitespace(value));
 }
 
 function normalizeCsvName(value) {
@@ -175,25 +196,17 @@ function normalizeCsvName(value) {
 function splitCompetitorNames(value) {
     const raw = String(value || "").trim();
     if (!raw) return [];
-    return raw
-        .split(",")
-        .map(v => normalizeWhitespace(v))
-        .filter(Boolean);
+    return raw.split(",").map(v => normalizeWhitespace(v)).filter(Boolean);
 }
 
 function startsWithNumeric(value) {
-    const s = String(value || "").trim();
-    return /^[0-9]/.test(s);
+    return /^[0-9]/.test(String(value || "").trim());
 }
 
 function normalizeSoloistEntryId(value) {
     const raw = String(value || "").trim();
     if (!raw) return "";
     return raw.replace(/c$/i, "").trim();
-}
-
-function isContemporaryEntryId(value) {
-    return /c$/i.test(String(value || "").trim());
 }
 
 function getMultiSelectNames(cellValue) {
@@ -206,10 +219,6 @@ function includesAny(list, targets) {
     return targets.some(t => set.has(t));
 }
 
-function makeNameDobKey(name, dobValue) {
-    return `${normalizeName(name)}||${normalizeDateKey(dobValue)}`;
-}
-
 function normalizeDateKey(value) {
     if (!value) return "";
     if (typeof value === "string") return value.trim();
@@ -220,6 +229,10 @@ function normalizeDateKey(value) {
     } catch (err) {
         return String(value).trim();
     }
+}
+
+function makeNameDobKey(name, dobValue) {
+    return `${normalizeCompareName(name)}||${normalizeDateKey(dobValue)}`;
 }
 
 function uniqueArray(values) {
@@ -235,11 +248,6 @@ function addToMapSet(map, key, value) {
     if (!key || !value) return;
     if (!map.has(key)) map.set(key, new Set());
     map.get(key).add(value);
-}
-
-function addManyToMapSet(map, key, values) {
-    if (!Array.isArray(values)) return;
-    for (const value of values) addToMapSet(map, key, value);
 }
 
 async function batchCreateRecords(table, payloads, label = "records") {
@@ -278,6 +286,15 @@ function firstOrNull(arr) {
     return Array.isArray(arr) && arr.length ? arr[0] : null;
 }
 
+function isBlank(value) {
+    return normalizeWhitespace(value) === "";
+}
+
+function isMaleScholarshipMatchAllowed(finalsLsName, scholarshipSex) {
+    if (!nameHasMaleSuffix(finalsLsName)) return true;
+    return normalizeWhitespace(scholarshipSex).toLowerCase() === CFG.VALUES.SEX.MALE.toLowerCase();
+}
+
 ////////////////////////////////////////
 // LOAD TABLES
 ////////////////////////////////////////
@@ -294,7 +311,7 @@ const ensemblesTable = assertTable(base, CFG.TABLES.ENSEMBLES);
 // LOAD RECORDS
 ////////////////////////////////////////
 
-output.markdown(`### FIN-1-RosterGeneration-v1.0.26`);
+output.markdown(`### FIN-1-RosterGeneration-v1.1.26`);
 output.text("Loading records...");
 
 const [
@@ -321,24 +338,24 @@ console.log("Records loaded.");
 // INDEX SUPPORT TABLES
 ////////////////////////////////////////
 
-const scholarshipByExactName = new Map();
+const scholarshipByCompareName = new Map();
 const scholarshipByNameDob = new Map();
 const scholarshipByNormalizedEntryId = new Map();
 
 for (const rec of scholarshipQuery.records) {
     const fullName = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.FULL_NAME));
-    const normName = normalizeName(fullName);
+    const compareName = normalizeCompareName(fullName);
     const dob = rec.getCellValue(CFG.FIELDS.SCHOLARSHIP.DOB);
     const nameDobKey = makeNameDobKey(fullName, dob);
     const entryIdRaw = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.ENTRY_ID));
     const entryIdNorm = normalizeSoloistEntryId(entryIdRaw);
 
-    if (normName) {
-        if (!scholarshipByExactName.has(normName)) scholarshipByExactName.set(normName, []);
-        scholarshipByExactName.get(normName).push(rec);
+    if (compareName) {
+        if (!scholarshipByCompareName.has(compareName)) scholarshipByCompareName.set(compareName, []);
+        scholarshipByCompareName.get(compareName).push(rec);
     }
 
-    if (normName && normalizeDateKey(dob)) {
+    if (compareName && normalizeDateKey(dob)) {
         if (!scholarshipByNameDob.has(nameDobKey)) scholarshipByNameDob.set(nameDobKey, []);
         scholarshipByNameDob.get(nameDobKey).push(rec);
     }
@@ -350,35 +367,35 @@ for (const rec of scholarshipQuery.records) {
 }
 
 const profilesByNameDob = new Map();
-const profilesByName = new Map();
+const profilesByCompareName = new Map();
 
 for (const rec of profilesQuery.records) {
     const fullName = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.PROFILES.FULL_NAME));
-    const normName = normalizeName(fullName);
+    const compareName = normalizeCompareName(fullName);
     const dob = rec.getCellValue(CFG.FIELDS.PROFILES.DOB);
     const nameDobKey = makeNameDobKey(fullName, dob);
 
-    if (normName) {
-        if (!profilesByName.has(normName)) profilesByName.set(normName, []);
-        profilesByName.get(normName).push(rec);
+    if (compareName) {
+        if (!profilesByCompareName.has(compareName)) profilesByCompareName.set(compareName, []);
+        profilesByCompareName.get(compareName).push(rec);
     }
 
-    if (normName && normalizeDateKey(dob)) {
+    if (compareName && normalizeDateKey(dob)) {
         if (!profilesByNameDob.has(nameDobKey)) profilesByNameDob.set(nameDobKey, []);
         profilesByNameDob.get(nameDobKey).push(rec);
     }
 }
 
 const invitationsByProfileId = new Map();
-const invitationsByName = new Map();
+const invitationsByCompareName = new Map();
 
 for (const rec of invitationsQuery.records) {
     const name = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.INVITATIONS.FULL_NAME));
-    const normName = normalizeName(name);
+    const compareName = normalizeCompareName(name);
     const linkedProfileIds = uniqueRecordIdsFromLinkedCell(rec.getCellValue(CFG.FIELDS.INVITATIONS.COMPETITOR_PROFILE));
 
     for (const profileId of linkedProfileIds) addToMapSet(invitationsByProfileId, profileId, rec.id);
-    if (normName) addToMapSet(invitationsByName, normName, rec.id);
+    if (compareName) addToMapSet(invitationsByCompareName, compareName, rec.id);
 }
 
 const regionalsByProfileId = new Map();
@@ -391,34 +408,28 @@ for (const rec of regionalsQuery.records) {
     const key = makeNameDobKey(fullName, dob);
 
     for (const profileId of linkedProfileIds) addToMapSet(regionalsByProfileId, profileId, rec.id);
-    if (normalizeName(fullName) && normalizeDateKey(dob)) addToMapSet(regionalsByNameDob, key, rec.id);
+    if (normalizeCompareName(fullName) && normalizeDateKey(dob)) addToMapSet(regionalsByNameDob, key, rec.id);
 }
 
 const ensembleIdsByParticipantName = new Map();
-const ensembleIdsByGroupName = new Map();
-const ensembleProfileIdsByEnsembleId = new Map();
 
 for (const rec of ensemblesQuery.records) {
     const participantNames = splitCompetitorNames(rec.getCellValueAsString(CFG.FIELDS.ENSEMBLES.PARTICIPANTS));
-    const groupName = normalizeName(rec.getCellValueAsString(CFG.FIELDS.ENSEMBLES.GROUP_NAME));
-    const linkedProfileIds = uniqueRecordIdsFromLinkedCell(rec.getCellValue(CFG.FIELDS.ENSEMBLES.COMPETITOR_PROFILES));
-
-    for (const name of participantNames) addToMapSet(ensembleIdsByParticipantName, normalizeName(name), rec.id);
-    if (groupName) addToMapSet(ensembleIdsByGroupName, groupName, rec.id);
-
-    ensembleProfileIdsByEnsembleId.set(rec.id, new Set(linkedProfileIds));
+    for (const name of participantNames) {
+        addToMapSet(ensembleIdsByParticipantName, normalizeCompareName(name), rec.id);
+    }
 }
 
 const finalsRosterByEntryId = new Map();
-const finalsRosterByName = new Map();
+const finalsRosterByCompareName = new Map();
 
 for (const rec of finalsRosterQuery.records) {
     const entryId = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.FINALS_ROSTER.ENTRY_ID));
     const fullName = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.FINALS_ROSTER.FULL_NAME));
-    const normName = normalizeName(fullName);
+    const compareName = normalizeCompareName(fullName);
 
     if (entryId) finalsRosterByEntryId.set(entryId, rec);
-    if (normName && !finalsRosterByName.has(normName)) finalsRosterByName.set(normName, rec);
+    if (compareName && !finalsRosterByCompareName.has(compareName)) finalsRosterByCompareName.set(compareName, rec);
 }
 
 ////////////////////////////////////////
@@ -427,12 +438,13 @@ for (const rec of finalsRosterQuery.records) {
 
 output.text("Parsing Finals LS...");
 
-const competitorMap = new Map(); // key = normalized full name
-const finalsLsRoutineProfileLinks = new Map(); // finals ls record id -> Set(profile ids)
+const competitorMap = new Map();
+const finalsLsRoutineProfileLinks = new Map();
 
 function getOrCreateCompetitor(displayName) {
     const cleanName = normalizeWhitespace(displayName);
-    const key = normalizeName(cleanName);
+    const key = normalizeCompareName(cleanName);
+
     if (!competitorMap.has(key)) {
         competitorMap.set(key, {
             key,
@@ -455,10 +467,12 @@ function getOrCreateCompetitor(displayName) {
             idConflict: false,
         });
     }
+
     return competitorMap.get(key);
 }
 
 const validFinalsLsRecords = [];
+
 for (const rec of finalsLsQuery.records) {
     const entryIdRaw = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.FINALS_LS.ENTRY_ID));
     if (!startsWithNumeric(entryIdRaw)) continue;
@@ -493,7 +507,7 @@ for (const rec of validFinalsLsRecords) {
 
         if (!person.baseEntryId) {
             person.baseEntryId = baseEntryId;
-        } else if (person.baseEntryId !== baseEntryId) {
+        } else if (!isBlank(baseEntryId) && person.baseEntryId !== baseEntryId) {
             person.idConflict = true;
             person.buildStatus = CFG.VALUES.BUILD_STATUS.ID_CONFLICT;
             person.buildNotes = appendNote(
@@ -503,9 +517,9 @@ for (const rec of validFinalsLsRecords) {
             console.log(`REVIEW: ID conflict for ${person.fullName} in Finals LS (${person.baseEntryId} vs ${baseEntryId})`);
         }
 
-        if (!person.ageDivision) {
-            person.ageDivision = ageDivision;
-        } else if (person.ageDivision !== ageDivision) {
+        if (isBlank(person.ageDivision)) {
+            if (!isBlank(ageDivision)) person.ageDivision = ageDivision;
+        } else if (!isBlank(ageDivision) && person.ageDivision !== ageDivision) {
             person.buildStatus = CFG.VALUES.BUILD_STATUS.REVIEW;
             person.buildNotes = appendNote(
                 person.buildNotes,
@@ -520,12 +534,22 @@ for (const rec of validFinalsLsRecords) {
             const person = getOrCreateCompetitor(name);
             person.groupRoutineIds.add(rec.id);
             person.finalsLsRecordIds.add(rec.id);
-            if (!person.ageDivision) person.ageDivision = ageDivision;
 
-            addToMapSet(ensembleIdsByParticipantName, normalizeName(name), null); // noop safe pattern
+            if (isBlank(person.ageDivision)) {
+                if (!isBlank(ageDivision)) person.ageDivision = ageDivision;
+            } else if (!isBlank(ageDivision) && person.ageDivision !== ageDivision) {
+                // group rows can differ less reliably; only review if both are present and different
+                person.buildStatus =
+                    person.buildStatus === CFG.VALUES.BUILD_STATUS.OK
+                        ? CFG.VALUES.BUILD_STATUS.REVIEW
+                        : person.buildStatus;
+                person.buildNotes = appendNote(
+                    person.buildNotes,
+                    `Conflicting Age Division in Finals LS group routines: existing ${person.ageDivision}, new ${ageDivision}`
+                );
+                console.log(`REVIEW: Age Division conflict for ${person.fullName} in Finals LS (${person.ageDivision} vs ${ageDivision})`);
+            }
         }
-
-        // No roster-level group ID assignment here; ensemble links resolved later.
     }
 }
 
@@ -545,10 +569,6 @@ for (const person of competitorMap.values()) {
     } else if (isGroupOnly) {
         person.competitorType = CFG.VALUES.COMPETITOR_TYPE.ENSEMBLE_ONLY;
     }
-
-    if (!person.baseEntryId && person.competitorType === CFG.VALUES.COMPETITOR_TYPE.ENSEMBLE_ONLY) {
-        // defer until scholarship matching first
-    }
 }
 
 console.log(`Parsed ${competitorMap.size} unique competitors from Finals LS.`);
@@ -558,41 +578,51 @@ console.log(`Parsed ${competitorMap.size} unique competitors from Finals LS.`);
 ////////////////////////////////////////
 
 for (const person of competitorMap.values()) {
-    const normName = normalizeName(person.fullName);
     let matchedScholarship = null;
+    const compareName = person.key;
+    const requiresMaleCheck = nameHasMaleSuffix(person.fullName);
 
     if (person.competitorType === CFG.VALUES.COMPETITOR_TYPE.SOLOIST && person.baseEntryId) {
         const candidatesById = scholarshipByNormalizedEntryId.get(person.baseEntryId) || [];
-        const exactNameMatches = candidatesById.filter(r =>
-            normalizeName(r.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.FULL_NAME)) === normName
-        );
 
-        if (exactNameMatches.length === 1) {
-            matchedScholarship = exactNameMatches[0];
-        } else if (exactNameMatches.length > 1) {
+        const normalizedNameCandidates = candidatesById.filter(r => {
+            const scholarshipName = normalizeWhitespace(r.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.FULL_NAME));
+            const scholarshipSex = normalizeWhitespace(r.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.SEX));
+            return normalizeCompareName(scholarshipName) === compareName
+                && isMaleScholarshipMatchAllowed(person.fullName, scholarshipSex);
+        });
+
+        if (normalizedNameCandidates.length === 1) {
+            matchedScholarship = normalizedNameCandidates[0];
+        } else if (normalizedNameCandidates.length > 1) {
             person.buildStatus = CFG.VALUES.BUILD_STATUS.REVIEW;
-            person.buildNotes = appendNote(person.buildNotes, "Multiple Scholarship Book matches by EntryID + Full Name.");
+            person.buildNotes = appendNote(person.buildNotes, "Multiple Scholarship Book matches by EntryID + normalized Full Name.");
             console.log(`REVIEW: Multiple Scholarship Book matches for soloist ${person.fullName} (${person.baseEntryId})`);
         } else if (candidatesById.length) {
-            const candidateNames = candidatesById.map(r => r.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.FULL_NAME));
+            const candidateSummary = candidatesById.map(r => {
+                const nm = r.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.FULL_NAME);
+                const sx = r.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.SEX);
+                return `${nm}${sx ? ` [${sx}]` : ""}`;
+            });
             person.buildStatus = CFG.VALUES.BUILD_STATUS.ID_CONFLICT;
             person.buildNotes = appendNote(
                 person.buildNotes,
-                `Scholarship Book EntryID matched but name mismatch. Finals LS name: ${person.fullName}; Scholarship names: ${candidateNames.join(", ")}`
+                `Scholarship Book EntryID matched but normalized name/sex validation failed. Scholarship candidates: ${candidateSummary.join(", ")}`
             );
             console.log(`REVIEW: Scholarship EntryID/name mismatch for ${person.fullName} (${person.baseEntryId})`);
         }
     }
 
     if (!matchedScholarship) {
-        const exactNameMatches = scholarshipByExactName.get(normName) || [];
-        if (exactNameMatches.length === 1) {
-            matchedScholarship = exactNameMatches[0];
+        const exactCompareMatches = (scholarshipByCompareName.get(compareName) || []).filter(r => {
+            const scholarshipSex = normalizeWhitespace(r.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.SEX));
+            return isMaleScholarshipMatchAllowed(person.fullName, scholarshipSex);
+        });
 
-            if (
-                person.competitorType === CFG.VALUES.COMPETITOR_TYPE.SOLOIST &&
-                person.baseEntryId
-            ) {
+        if (exactCompareMatches.length === 1) {
+            matchedScholarship = exactCompareMatches[0];
+
+            if (person.competitorType === CFG.VALUES.COMPETITOR_TYPE.SOLOIST && person.baseEntryId) {
                 const scholarshipEntryId = normalizeSoloistEntryId(
                     matchedScholarship.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.ENTRY_ID)
                 );
@@ -600,27 +630,42 @@ for (const person of competitorMap.values()) {
                     person.buildStatus = CFG.VALUES.BUILD_STATUS.ID_CONFLICT;
                     person.buildNotes = appendNote(
                         person.buildNotes,
-                        `Same name matched Scholarship Book but EntryIDs differ: Finals LS ${person.baseEntryId}, Scholarship ${scholarshipEntryId}`
+                        `Normalized name matched Scholarship Book but EntryIDs differ: Finals LS ${person.baseEntryId}, Scholarship ${scholarshipEntryId}`
                     );
                     console.log(`REVIEW: Same-name different-ID conflict for ${person.fullName}`);
                 }
             }
-        } else if (exactNameMatches.length > 1) {
-            person.buildStatus =
-                person.buildStatus === CFG.VALUES.BUILD_STATUS.OK
-                    ? CFG.VALUES.BUILD_STATUS.REVIEW
-                    : person.buildStatus;
-            person.buildNotes = appendNote(person.buildNotes, "Multiple Scholarship Book matches by Full Name.");
-            console.log(`REVIEW: Multiple Scholarship Book name matches for ${person.fullName}`);
+        } else if (exactCompareMatches.length > 1) {
+            if (person.scholarshipDob) {
+                const keyed = scholarshipByNameDob.get(makeNameDobKey(person.fullName, person.scholarshipDob)) || [];
+                if (keyed.length === 1) {
+                    matchedScholarship = keyed[0];
+                } else {
+                    person.buildStatus =
+                        person.buildStatus === CFG.VALUES.BUILD_STATUS.OK
+                            ? CFG.VALUES.BUILD_STATUS.REVIEW
+                            : person.buildStatus;
+                    person.buildNotes = appendNote(person.buildNotes, "Multiple Scholarship Book matches by normalized Full Name.");
+                    console.log(`REVIEW: Multiple Scholarship Book name matches for ${person.fullName}`);
+                }
+            } else {
+                person.buildStatus =
+                    person.buildStatus === CFG.VALUES.BUILD_STATUS.OK
+                        ? CFG.VALUES.BUILD_STATUS.REVIEW
+                        : person.buildStatus;
+                person.buildNotes = appendNote(person.buildNotes, "Multiple Scholarship Book matches by normalized Full Name.");
+                console.log(`REVIEW: Multiple Scholarship Book name matches for ${person.fullName}`);
+            }
         }
     }
 
     if (matchedScholarship) {
         person.scholarshipRecordId = matchedScholarship.id;
         person.scholarshipDob = normalizeDateKey(matchedScholarship.getCellValue(CFG.FIELDS.SCHOLARSHIP.DOB));
-        const scholarshipProfileId = firstOrNull(uniqueRecordIdsFromLinkedCell(
-            matchedScholarship.getCellValue(CFG.FIELDS.SCHOLARSHIP.COMPETITOR_PROFILE)
-        ));
+
+        const scholarshipProfileId = firstOrNull(
+            uniqueRecordIdsFromLinkedCell(matchedScholarship.getCellValue(CFG.FIELDS.SCHOLARSHIP.COMPETITOR_PROFILE))
+        );
         if (scholarshipProfileId) person.scholarshipProfileId = scholarshipProfileId;
 
         if (person.competitorType === CFG.VALUES.COMPETITOR_TYPE.ENSEMBLE_ONLY) {
@@ -654,7 +699,6 @@ for (const person of competitorMap.values()) {
 ////////////////////////////////////////
 
 const profilesToCreate = [];
-const personKeyToCreatedProfileSeed = new Map();
 
 for (const person of competitorMap.values()) {
     let matchedProfile = null;
@@ -670,24 +714,24 @@ for (const person of competitorMap.values()) {
             matchedProfile = candidates[0];
         } else if (candidates.length > 1) {
             person.buildStatus = CFG.VALUES.BUILD_STATUS.REVIEW;
-            person.buildNotes = appendNote(person.buildNotes, "Multiple Competitor Profiles matched by Full Name + DOB.");
+            person.buildNotes = appendNote(person.buildNotes, "Multiple Competitor Profiles matched by normalized Full Name + DOB.");
             console.log(`REVIEW: Multiple profile matches for ${person.fullName} by name + DOB.`);
         }
     }
 
     if (!matchedProfile && person.competitorType === CFG.VALUES.COMPETITOR_TYPE.SOLOIST) {
-        const singleNameCandidates = profilesByName.get(normalizeName(person.fullName)) || [];
+        const singleNameCandidates = profilesByCompareName.get(person.key) || [];
         if (singleNameCandidates.length === 1) {
             matchedProfile = singleNameCandidates[0];
             person.buildStatus =
                 person.buildStatus === CFG.VALUES.BUILD_STATUS.OK
                     ? CFG.VALUES.BUILD_STATUS.REVIEW
                     : person.buildStatus;
-            person.buildNotes = appendNote(person.buildNotes, "Profile matched by Full Name only; verify DOB manually.");
+            person.buildNotes = appendNote(person.buildNotes, "Profile matched by normalized Full Name only; verify DOB manually.");
             console.log(`REVIEW: ${person.fullName} matched profile by name only.`);
         } else if (singleNameCandidates.length > 1) {
             person.buildStatus = CFG.VALUES.BUILD_STATUS.REVIEW;
-            person.buildNotes = appendNote(person.buildNotes, "Multiple Competitor Profiles matched by Full Name only.");
+            person.buildNotes = appendNote(person.buildNotes, "Multiple Competitor Profiles matched by normalized Full Name only.");
             console.log(`REVIEW: Multiple name-only profile matches for ${person.fullName}`);
         }
     }
@@ -697,7 +741,6 @@ for (const person of competitorMap.values()) {
         continue;
     }
 
-    // Create missing profile
     person.buildStatus =
         person.buildStatus === CFG.VALUES.BUILD_STATUS.OK
             ? CFG.VALUES.BUILD_STATUS.MISSING_PROFILE
@@ -706,41 +749,38 @@ for (const person of competitorMap.values()) {
 
     const fields = {};
     fields[CFG.FIELDS.PROFILES.FULL_NAME] = person.fullName;
-    fields[CFG.FIELDS.PROFILES.STATUS] = { name: CFG.VALUES.PROFILE_STATUS.NEW };
+    fields[CFG.FIELDS.PROFILES.STATUS] = [{ name: CFG.VALUES.PROFILE_STATUS.NEW }];
     fields[CFG.FIELDS.PROFILES.COMPETITOR_TYPE] = { name: person.competitorType };
 
     if (person.scholarshipDob) {
         fields[CFG.FIELDS.PROFILES.DOB] = person.scholarshipDob;
     }
 
-    profilesToCreate.push({ fields, __personKey: person.key });
-    personKeyToCreatedProfileSeed.set(person.key, true);
+    profilesToCreate.push({ fields });
 }
 
 if (profilesToCreate.length) {
-    const createPayloads = profilesToCreate.map(({ fields }) => ({ fields }));
-    await batchCreateRecords(profilesTable, createPayloads, "Competitor Profiles");
+    await batchCreateRecords(profilesTable, profilesToCreate, "Competitor Profiles");
 }
 
 if (profilesToCreate.length) {
-    // Re-query profiles to recover newly created IDs reliably
     const profilesQueryAfterCreate = await profilesTable.selectRecordsAsync();
 
     const refreshedProfilesByNameDob = new Map();
-    const refreshedProfilesByName = new Map();
+    const refreshedProfilesByCompareName = new Map();
 
     for (const rec of profilesQueryAfterCreate.records) {
         const name = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.PROFILES.FULL_NAME));
         const dob = rec.getCellValue(CFG.FIELDS.PROFILES.DOB);
-        const normName = normalizeName(name);
+        const compareName = normalizeCompareName(name);
         const key = makeNameDobKey(name, dob);
 
-        if (normName) {
-            if (!refreshedProfilesByName.has(normName)) refreshedProfilesByName.set(normName, []);
-            refreshedProfilesByName.get(normName).push(rec);
+        if (compareName) {
+            if (!refreshedProfilesByCompareName.has(compareName)) refreshedProfilesByCompareName.set(compareName, []);
+            refreshedProfilesByCompareName.get(compareName).push(rec);
         }
 
-        if (normName && normalizeDateKey(dob)) {
+        if (compareName && normalizeDateKey(dob)) {
             if (!refreshedProfilesByNameDob.has(key)) refreshedProfilesByNameDob.set(key, []);
             refreshedProfilesByNameDob.get(key).push(rec);
         }
@@ -754,17 +794,15 @@ if (profilesToCreate.length) {
         if (person.scholarshipDob) {
             const candidates = refreshedProfilesByNameDob.get(makeNameDobKey(person.fullName, person.scholarshipDob)) || [];
             const newCandidates = candidates.filter(r =>
-                r.getCellValueAsString(CFG.FIELDS.PROFILES.STATUS) === CFG.VALUES.PROFILE_STATUS.NEW
+                getMultiSelectNames(r.getCellValue(CFG.FIELDS.PROFILES.STATUS)).includes(CFG.VALUES.PROFILE_STATUS.NEW)
             );
-            if (newCandidates.length === 1) {
-                matchedCreated = newCandidates[0];
-            }
+            if (newCandidates.length === 1) matchedCreated = newCandidates[0];
         }
 
         if (!matchedCreated) {
-            const candidates = refreshedProfilesByName.get(normalizeName(person.fullName)) || [];
+            const candidates = refreshedProfilesByCompareName.get(person.key) || [];
             const newCandidates = candidates.filter(r =>
-                r.getCellValueAsString(CFG.FIELDS.PROFILES.STATUS) === CFG.VALUES.PROFILE_STATUS.NEW
+                getMultiSelectNames(r.getCellValue(CFG.FIELDS.PROFILES.STATUS)).includes(CFG.VALUES.PROFILE_STATUS.NEW)
             );
             if (newCandidates.length === 1) matchedCreated = newCandidates[0];
         }
@@ -782,18 +820,16 @@ if (profilesToCreate.length) {
 ////////////////////////////////////////
 
 for (const person of competitorMap.values()) {
-    // Finals Invitations
     if (person.competitorProfileId && invitationsByProfileId.has(person.competitorProfileId)) {
-        addManyToMapSet(person.finalsInvitationIds, "__self__", [...invitationsByProfileId.get(person.competitorProfileId)]);
-    } else if (invitationsByName.has(person.key)) {
-        addManyToMapSet(person.finalsInvitationIds, "__self__", [...invitationsByName.get(person.key)]);
+        for (const invitationId of invitationsByProfileId.get(person.competitorProfileId)) {
+            person.finalsInvitationIds.add(invitationId);
+        }
+    } else if (invitationsByCompareName.has(person.key)) {
+        for (const invitationId of invitationsByCompareName.get(person.key)) {
+            person.finalsInvitationIds.add(invitationId);
+        }
     }
 
-    if (person.finalsInvitationIds instanceof Map) {
-        // safety no-op
-    }
-
-    // Regionals
     if (person.competitorType === CFG.VALUES.COMPETITOR_TYPE.SOLOIST) {
         if (person.competitorProfileId && regionalsByProfileId.has(person.competitorProfileId)) {
             for (const regionalId of regionalsByProfileId.get(person.competitorProfileId)) {
@@ -806,28 +842,10 @@ for (const person of competitorMap.values()) {
         }
     }
 
-    // Ensembles
     if (person.groupRoutineIds.size > 0) {
         const ensembleIds = ensembleIdsByParticipantName.get(person.key) || new Set();
         for (const ensembleId of ensembleIds) {
             if (ensembleId) person.ensembleRegEntryIds.add(ensembleId);
-        }
-    }
-}
-
-// Fix finalsInvitationIds structure if helper above didn't apply due to Set usage
-for (const person of competitorMap.values()) {
-    if (!(person.finalsInvitationIds instanceof Set)) {
-        person.finalsInvitationIds = new Set();
-    }
-
-    if (person.competitorProfileId && invitationsByProfileId.has(person.competitorProfileId)) {
-        for (const invitationId of invitationsByProfileId.get(person.competitorProfileId)) {
-            person.finalsInvitationIds.add(invitationId);
-        }
-    } else if (invitationsByName.has(person.key)) {
-        for (const invitationId of invitationsByName.get(person.key)) {
-            person.finalsInvitationIds.add(invitationId);
         }
     }
 }
@@ -846,10 +864,10 @@ for (const person of competitorMap.values()) {
     fields[CFG.FIELDS.FINALS_ROSTER.ENTRY_ID] = person.baseEntryId || "";
     fields[CFG.FIELDS.FINALS_ROSTER.COMPETITOR_TYPE] = { name: person.competitorType };
     fields[CFG.FIELDS.FINALS_ROSTER.FULL_NAME] = person.fullName;
-    if (person.ageDivision) {
+
+    if (!isBlank(person.ageDivision)) {
         fields[CFG.FIELDS.FINALS_ROSTER.AGE_DIVISION] = { name: person.ageDivision };
     }
-
     if (person.competitorProfileId) {
         fields[CFG.FIELDS.FINALS_ROSTER.COMPETITOR_PROFILE] = linkedRecordArray([person.competitorProfileId]);
     }
@@ -872,30 +890,20 @@ for (const person of competitorMap.values()) {
     let existing = null;
     if (person.baseEntryId && finalsRosterByEntryId.has(person.baseEntryId)) {
         existing = finalsRosterByEntryId.get(person.baseEntryId);
-    } else if (finalsRosterByName.has(person.key)) {
-        existing = finalsRosterByName.get(person.key);
+    } else if (finalsRosterByCompareName.has(person.key)) {
+        existing = finalsRosterByCompareName.get(person.key);
     }
 
     if (existing) {
-        finalsRosterUpdates.push({
-            id: existing.id,
-            fields,
-        });
+        finalsRosterUpdates.push({ id: existing.id, fields });
         personKeyToRosterRecordId.set(person.key, existing.id);
     } else {
-        finalsRosterCreates.push({
-            fields,
-            __personKey: person.key,
-        });
+        finalsRosterCreates.push({ fields });
     }
 }
 
 if (finalsRosterCreates.length) {
-    await batchCreateRecords(
-        finalsRosterTable,
-        finalsRosterCreates.map(x => ({ fields: x.fields })),
-        "Finals Roster records"
-    );
+    await batchCreateRecords(finalsRosterTable, finalsRosterCreates, "Finals Roster records");
 }
 
 if (finalsRosterUpdates.length) {
@@ -904,12 +912,14 @@ if (finalsRosterUpdates.length) {
 
 if (finalsRosterCreates.length) {
     const finalsRosterQueryAfterCreate = await finalsRosterTable.selectRecordsAsync();
+
     for (const rec of finalsRosterQueryAfterCreate.records) {
         const entryId = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.FINALS_ROSTER.ENTRY_ID));
         const fullName = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.FINALS_ROSTER.FULL_NAME));
-        const normName = normalizeName(fullName);
+        const compareName = normalizeCompareName(fullName);
+
         if (entryId) finalsRosterByEntryId.set(entryId, rec);
-        if (normName && !finalsRosterByName.has(normName)) finalsRosterByName.set(normName, rec);
+        if (compareName && !finalsRosterByCompareName.has(compareName)) finalsRosterByCompareName.set(compareName, rec);
     }
 
     for (const person of competitorMap.values()) {
@@ -918,8 +928,8 @@ if (finalsRosterCreates.length) {
         let rosterRec = null;
         if (person.baseEntryId && finalsRosterByEntryId.has(person.baseEntryId)) {
             rosterRec = finalsRosterByEntryId.get(person.baseEntryId);
-        } else if (finalsRosterByName.has(person.key)) {
-            rosterRec = finalsRosterByName.get(person.key);
+        } else if (finalsRosterByCompareName.has(person.key)) {
+            rosterRec = finalsRosterByCompareName.get(person.key);
         }
 
         if (rosterRec) personKeyToRosterRecordId.set(person.key, rosterRec.id);
@@ -939,13 +949,13 @@ for (const rec of validFinalsLsRecords) {
     const isGroupRoutine = includesAny(categoryNames, CFG.PERFORMANCE_CATEGORY.GROUP);
 
     if (isSoloistRoutine && competitorNames.length) {
-        const person = competitorMap.get(normalizeName(competitorNames[0]));
+        const person = competitorMap.get(normalizeCompareName(competitorNames[0]));
         if (person?.competitorProfileId) linkedProfileIds.add(person.competitorProfileId);
     }
 
     if (isGroupRoutine) {
         for (const name of competitorNames) {
-            const person = competitorMap.get(normalizeName(name));
+            const person = competitorMap.get(normalizeCompareName(name));
             if (person?.competitorProfileId) linkedProfileIds.add(person.competitorProfileId);
         }
     }
@@ -974,13 +984,19 @@ if (finalsLsUpdates.length) {
 let soloistCount = 0;
 let ensembleOnlyCount = 0;
 let reviewCount = 0;
-let missingProfileCount = 0;
+let unresolvedProfileCount = 0;
 
 for (const person of competitorMap.values()) {
     if (person.competitorType === CFG.VALUES.COMPETITOR_TYPE.SOLOIST) soloistCount++;
     if (person.competitorType === CFG.VALUES.COMPETITOR_TYPE.ENSEMBLE_ONLY) ensembleOnlyCount++;
-    if (person.buildStatus === CFG.VALUES.BUILD_STATUS.REVIEW || person.buildStatus === CFG.VALUES.BUILD_STATUS.ID_CONFLICT || person.buildStatus === CFG.VALUES.BUILD_STATUS.DOB_CONFLICT) reviewCount++;
-    if (!person.competitorProfileId) missingProfileCount++;
+    if (
+        person.buildStatus === CFG.VALUES.BUILD_STATUS.REVIEW ||
+        person.buildStatus === CFG.VALUES.BUILD_STATUS.ID_CONFLICT ||
+        person.buildStatus === CFG.VALUES.BUILD_STATUS.DOB_CONFLICT
+    ) {
+        reviewCount++;
+    }
+    if (!person.competitorProfileId) unresolvedProfileCount++;
 }
 
 output.markdown(`### Complete`);
@@ -988,11 +1004,11 @@ output.text(`Unique competitors processed: ${competitorMap.size}`);
 output.text(`Soloists: ${soloistCount}`);
 output.text(`Ensemble only: ${ensembleOnlyCount}`);
 output.text(`Records flagged for review: ${reviewCount}`);
-output.text(`Profiles without linked ID after run: ${missingProfileCount}`);
+output.text(`Profiles still unresolved after run: ${unresolvedProfileCount}`);
 
-console.log("FIN-1-RosterGeneration-v1.0.26 completed.");
+console.log("FIN-1-RosterGeneration-v1.1.26 completed.");
 console.log(`Processed competitors: ${competitorMap.size}`);
 console.log(`Soloists: ${soloistCount}`);
 console.log(`Ensemble only: ${ensembleOnlyCount}`);
 console.log(`Review count: ${reviewCount}`);
-console.log(`Missing profile count after run: ${missingProfileCount}`);
+console.log(`Unresolved profiles after run: ${unresolvedProfileCount}`);
