@@ -1,0 +1,998 @@
+/**
+ * FIN-1-RosterGeneration-v1.0.26
+ * FINALS LS -> Build/update FINALS ROSTER + link Competitor Profiles + link supporting records
+ *
+ * BUG FIXES:
+ * - N/A
+ *
+ * BEHAVIOR:
+ * - Bulk execution script for Airtable Scripting Extension.
+ * - Reads "Finals LS" as the source of truth for all actual attending finalists.
+ * - Ignores header/non-data rows where the first character of {EntryID} is not numeric.
+ * - Builds a person-level competitor universe from routine-level records:
+ *    - SOLOIST = any person appearing in COMPULSORY (R1), CLASSICAL (R2), or CONTEMPORARY (R2)
+ *    - ENSEMBLE ONLY = any person appearing only in PAS DE DEUX (R2), DUO | TRIO (R2), or ENSEMBLE (R2)
+ * - Normalizes soloist IDs by stripping a trailing lowercase "c" from contemporary EntryIDs.
+ * - Creates or updates one record per competitor in "Finals Roster".
+ * - Links Finals Roster records to:
+ *    - {Scholarship Book Info}
+ *    - {Competitor Profile}
+ *    - {Finals Invitation}
+ *    - {Soloist Reg EntryID}
+ *    - {Ensemble Reg EntryID}
+ * - Creates missing Competitor Profiles and sets:
+ *    - {Status} = "NEW"
+ *    - {Competitor Type} = derived competitor type
+ * - Writes linked competitor profile(s) back to "Finals LS" -> {Competitor Profile(s)}.
+ * - Flags ambiguous / manual-review cases in:
+ *    - Finals Roster {Build Status}
+ *    - Finals Roster {Build Notes}
+ * - Logs duplicate / conflicting / unresolved situations to the console for manual review.
+ */
+
+////////////////////////////////////////
+// CONFIG
+////////////////////////////////////////
+
+const CFG = {
+    TABLES: {
+        FINALS_LS: "Finals LS",
+        FINALS_ROSTER: "Finals Roster",
+        SCHOLARSHIP: "Finals Scholarship Book",
+        PROFILES: "Competitor Profiles",
+        INVITATIONS: "Finals Invitations",
+        REGIONALS: "Regionals Roster",
+        ENSEMBLES: "Ensembles",
+    },
+
+    FIELDS: {
+        FINALS_LS: {
+            ENTRY_ID: "EntryID",
+            COMPETITORS: "Competitor(s)",
+            PERFORMANCE_CATEGORY: "Performance Category",
+            AGE_DIVISION: "Age Division",
+            COMPETITOR_PROFILES: "Competitor Profile(s)",
+        },
+
+        FINALS_ROSTER: {
+            ENTRY_ID: "EntryID",
+            COMPETITOR_TYPE: "Competitor Type",
+            FULL_NAME: "Full Name",
+            AGE_DIVISION: "Age Division",
+            COMPETITOR_PROFILE: "Competitor Profile",
+            SOLOIST_REG_ENTRY_ID: "Soloist Reg EntryID",
+            FINALS_INVITATION: "Finals Invitation",
+            ENSEMBLE_REG_ENTRY_ID: "Ensemble Reg EntryID",
+            SCHOLARSHIP_BOOK_INFO: "Scholarship Book Info",
+            BUILD_STATUS: "Build Status",
+            BUILD_NOTES: "Build Notes",
+        },
+
+        SCHOLARSHIP: {
+            ENTRY_ID: "EntryID",
+            FULL_NAME: "Full Name",
+            DOB: "DOB",
+            COMPETITOR_PROFILE: "Competitor Profile",
+        },
+
+        PROFILES: {
+            FULL_NAME: "Full Name",
+            DOB: "Date of Birth",
+            COMPETITOR_TYPE: "Competitor Type",
+            STATUS: "Status",
+        },
+
+        INVITATIONS: {
+            FULL_NAME: "Full Name",
+            DOB: "Date of Birth",
+            SOLOIST_REG_ENTRY_ID: "Soloist Reg EntryID",
+            ENSEMBLE_REG_ENTRY_ID: "Ensemble Reg EntryID",
+            COMPETITOR_PROFILE: "Competitor Profile",
+        },
+
+        REGIONALS: {
+            ENTRY_ID: "EntryID",
+            FULL_NAME: "Full Name",
+            DOB: "Date of Birth",
+            COMPETITOR_PROFILE: "Competitor Profile",
+        },
+
+        ENSEMBLES: {
+            ENTRY_ID: "EntryID",
+            PARTICIPANTS: "Participants",
+            GROUP_NAME: "Group Name",
+            COMPETITOR_PROFILES: "Competitor Profiles",
+        },
+    },
+
+    PERFORMANCE_CATEGORY: {
+        SOLOIST: [
+            "COMPULSORY (R1)",
+            "CLASSICAL (R2)",
+            "CONTEMPORARY (R2)",
+        ],
+        GROUP: [
+            "PAS DE DEUX (R2)",
+            "DUO | TRIO (R2)",
+            "ENSEMBLE (R2)",
+        ],
+    },
+
+    VALUES: {
+        COMPETITOR_TYPE: {
+            SOLOIST: "SOLOIST",
+            ENSEMBLE_ONLY: "ENSEMBLE ONLY",
+        },
+
+        BUILD_STATUS: {
+            OK: "OK",
+            REVIEW: "REVIEW",
+            MISSING_PROFILE: "MISSING PROFILE",
+            MISSING_SCHOLARSHIP_MATCH: "MISSING SCHOLARSHIP MATCH",
+            ID_CONFLICT: "ID CONFLICT",
+            DOB_CONFLICT: "DOB CONFLICT",
+        },
+
+        PROFILE_STATUS: {
+            NEW: "NEW",
+        },
+    },
+
+    BATCH_SIZE: 50,
+    TEMP_ID_PREFIX: "TEMP",
+    TEMP_ID_SUFFIX: "xs",
+};
+
+////////////////////////////////////////
+// HELPERS
+////////////////////////////////////////
+
+function assertTable(base, tableName) {
+    const table = base.getTable(tableName);
+    if (!table) {
+        throw new Error(`Missing table: ${tableName}`);
+    }
+    return table;
+}
+
+function normalizeWhitespace(value) {
+    return String(value || "")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function normalizeName(value) {
+    return normalizeWhitespace(value).toLowerCase();
+}
+
+function normalizeCsvName(value) {
+    return normalizeWhitespace(value)
+        .replace(/\s*,\s*/g, ", ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function splitCompetitorNames(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return [];
+    return raw
+        .split(",")
+        .map(v => normalizeWhitespace(v))
+        .filter(Boolean);
+}
+
+function startsWithNumeric(value) {
+    const s = String(value || "").trim();
+    return /^[0-9]/.test(s);
+}
+
+function normalizeSoloistEntryId(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    return raw.replace(/c$/i, "").trim();
+}
+
+function isContemporaryEntryId(value) {
+    return /c$/i.test(String(value || "").trim());
+}
+
+function getMultiSelectNames(cellValue) {
+    if (!Array.isArray(cellValue)) return [];
+    return cellValue.map(x => x.name).filter(Boolean);
+}
+
+function includesAny(list, targets) {
+    const set = new Set(list || []);
+    return targets.some(t => set.has(t));
+}
+
+function makeNameDobKey(name, dobValue) {
+    return `${normalizeName(name)}||${normalizeDateKey(dobValue)}`;
+}
+
+function normalizeDateKey(value) {
+    if (!value) return "";
+    if (typeof value === "string") return value.trim();
+    try {
+        const d = new Date(value);
+        if (isNaN(d.getTime())) return String(value).trim();
+        return d.toISOString().slice(0, 10);
+    } catch (err) {
+        return String(value).trim();
+    }
+}
+
+function uniqueArray(values) {
+    return [...new Set(values.filter(Boolean))];
+}
+
+function uniqueRecordIdsFromLinkedCell(cell) {
+    if (!Array.isArray(cell)) return [];
+    return uniqueArray(cell.map(x => x.id));
+}
+
+function addToMapSet(map, key, value) {
+    if (!key || !value) return;
+    if (!map.has(key)) map.set(key, new Set());
+    map.get(key).add(value);
+}
+
+function addManyToMapSet(map, key, values) {
+    if (!Array.isArray(values)) return;
+    for (const value of values) addToMapSet(map, key, value);
+}
+
+async function batchCreateRecords(table, payloads, label = "records") {
+    for (let i = 0; i < payloads.length; i += CFG.BATCH_SIZE) {
+        const chunk = payloads.slice(i, i + CFG.BATCH_SIZE);
+        await table.createRecordsAsync(chunk);
+        console.log(`Created ${chunk.length} ${label} in ${table.name}`);
+    }
+}
+
+async function batchUpdateRecords(table, payloads, label = "records") {
+    for (let i = 0; i < payloads.length; i += CFG.BATCH_SIZE) {
+        const chunk = payloads.slice(i, i + CFG.BATCH_SIZE);
+        await table.updateRecordsAsync(chunk);
+        console.log(`Updated ${chunk.length} ${label} in ${table.name}`);
+    }
+}
+
+function appendNote(existing, note) {
+    const base = String(existing || "").trim();
+    const add = String(note || "").trim();
+    if (!add) return base;
+    if (!base) return add;
+    return `${base}\n- ${add}`;
+}
+
+function buildTempEntryId(counter) {
+    return `${CFG.TEMP_ID_PREFIX}${String(counter).padStart(3, "0")}${CFG.TEMP_ID_SUFFIX}`;
+}
+
+function linkedRecordArray(ids) {
+    return uniqueArray(ids).map(id => ({ id }));
+}
+
+function firstOrNull(arr) {
+    return Array.isArray(arr) && arr.length ? arr[0] : null;
+}
+
+////////////////////////////////////////
+// LOAD TABLES
+////////////////////////////////////////
+
+const finalsLsTable = assertTable(base, CFG.TABLES.FINALS_LS);
+const finalsRosterTable = assertTable(base, CFG.TABLES.FINALS_ROSTER);
+const scholarshipTable = assertTable(base, CFG.TABLES.SCHOLARSHIP);
+const profilesTable = assertTable(base, CFG.TABLES.PROFILES);
+const invitationsTable = assertTable(base, CFG.TABLES.INVITATIONS);
+const regionalsTable = assertTable(base, CFG.TABLES.REGIONALS);
+const ensemblesTable = assertTable(base, CFG.TABLES.ENSEMBLES);
+
+////////////////////////////////////////
+// LOAD RECORDS
+////////////////////////////////////////
+
+output.markdown(`### FIN-1-RosterGeneration-v1.0.26`);
+output.text("Loading records...");
+
+const [
+    finalsLsQuery,
+    finalsRosterQuery,
+    scholarshipQuery,
+    profilesQuery,
+    invitationsQuery,
+    regionalsQuery,
+    ensemblesQuery,
+] = await Promise.all([
+    finalsLsTable.selectRecordsAsync(),
+    finalsRosterTable.selectRecordsAsync(),
+    scholarshipTable.selectRecordsAsync(),
+    profilesTable.selectRecordsAsync(),
+    invitationsTable.selectRecordsAsync(),
+    regionalsTable.selectRecordsAsync(),
+    ensemblesTable.selectRecordsAsync(),
+]);
+
+console.log("Records loaded.");
+
+////////////////////////////////////////
+// INDEX SUPPORT TABLES
+////////////////////////////////////////
+
+const scholarshipByExactName = new Map();
+const scholarshipByNameDob = new Map();
+const scholarshipByNormalizedEntryId = new Map();
+
+for (const rec of scholarshipQuery.records) {
+    const fullName = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.FULL_NAME));
+    const normName = normalizeName(fullName);
+    const dob = rec.getCellValue(CFG.FIELDS.SCHOLARSHIP.DOB);
+    const nameDobKey = makeNameDobKey(fullName, dob);
+    const entryIdRaw = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.ENTRY_ID));
+    const entryIdNorm = normalizeSoloistEntryId(entryIdRaw);
+
+    if (normName) {
+        if (!scholarshipByExactName.has(normName)) scholarshipByExactName.set(normName, []);
+        scholarshipByExactName.get(normName).push(rec);
+    }
+
+    if (normName && normalizeDateKey(dob)) {
+        if (!scholarshipByNameDob.has(nameDobKey)) scholarshipByNameDob.set(nameDobKey, []);
+        scholarshipByNameDob.get(nameDobKey).push(rec);
+    }
+
+    if (entryIdNorm) {
+        if (!scholarshipByNormalizedEntryId.has(entryIdNorm)) scholarshipByNormalizedEntryId.set(entryIdNorm, []);
+        scholarshipByNormalizedEntryId.get(entryIdNorm).push(rec);
+    }
+}
+
+const profilesByNameDob = new Map();
+const profilesByName = new Map();
+
+for (const rec of profilesQuery.records) {
+    const fullName = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.PROFILES.FULL_NAME));
+    const normName = normalizeName(fullName);
+    const dob = rec.getCellValue(CFG.FIELDS.PROFILES.DOB);
+    const nameDobKey = makeNameDobKey(fullName, dob);
+
+    if (normName) {
+        if (!profilesByName.has(normName)) profilesByName.set(normName, []);
+        profilesByName.get(normName).push(rec);
+    }
+
+    if (normName && normalizeDateKey(dob)) {
+        if (!profilesByNameDob.has(nameDobKey)) profilesByNameDob.set(nameDobKey, []);
+        profilesByNameDob.get(nameDobKey).push(rec);
+    }
+}
+
+const invitationsByProfileId = new Map();
+const invitationsByName = new Map();
+
+for (const rec of invitationsQuery.records) {
+    const name = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.INVITATIONS.FULL_NAME));
+    const normName = normalizeName(name);
+    const linkedProfileIds = uniqueRecordIdsFromLinkedCell(rec.getCellValue(CFG.FIELDS.INVITATIONS.COMPETITOR_PROFILE));
+
+    for (const profileId of linkedProfileIds) addToMapSet(invitationsByProfileId, profileId, rec.id);
+    if (normName) addToMapSet(invitationsByName, normName, rec.id);
+}
+
+const regionalsByProfileId = new Map();
+const regionalsByNameDob = new Map();
+
+for (const rec of regionalsQuery.records) {
+    const fullName = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.REGIONALS.FULL_NAME));
+    const dob = rec.getCellValue(CFG.FIELDS.REGIONALS.DOB);
+    const linkedProfileIds = uniqueRecordIdsFromLinkedCell(rec.getCellValue(CFG.FIELDS.REGIONALS.COMPETITOR_PROFILE));
+    const key = makeNameDobKey(fullName, dob);
+
+    for (const profileId of linkedProfileIds) addToMapSet(regionalsByProfileId, profileId, rec.id);
+    if (normalizeName(fullName) && normalizeDateKey(dob)) addToMapSet(regionalsByNameDob, key, rec.id);
+}
+
+const ensembleIdsByParticipantName = new Map();
+const ensembleIdsByGroupName = new Map();
+const ensembleProfileIdsByEnsembleId = new Map();
+
+for (const rec of ensemblesQuery.records) {
+    const participantNames = splitCompetitorNames(rec.getCellValueAsString(CFG.FIELDS.ENSEMBLES.PARTICIPANTS));
+    const groupName = normalizeName(rec.getCellValueAsString(CFG.FIELDS.ENSEMBLES.GROUP_NAME));
+    const linkedProfileIds = uniqueRecordIdsFromLinkedCell(rec.getCellValue(CFG.FIELDS.ENSEMBLES.COMPETITOR_PROFILES));
+
+    for (const name of participantNames) addToMapSet(ensembleIdsByParticipantName, normalizeName(name), rec.id);
+    if (groupName) addToMapSet(ensembleIdsByGroupName, groupName, rec.id);
+
+    ensembleProfileIdsByEnsembleId.set(rec.id, new Set(linkedProfileIds));
+}
+
+const finalsRosterByEntryId = new Map();
+const finalsRosterByName = new Map();
+
+for (const rec of finalsRosterQuery.records) {
+    const entryId = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.FINALS_ROSTER.ENTRY_ID));
+    const fullName = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.FINALS_ROSTER.FULL_NAME));
+    const normName = normalizeName(fullName);
+
+    if (entryId) finalsRosterByEntryId.set(entryId, rec);
+    if (normName && !finalsRosterByName.has(normName)) finalsRosterByName.set(normName, rec);
+}
+
+////////////////////////////////////////
+// BUILD PERSON UNIVERSE FROM FINALS LS
+////////////////////////////////////////
+
+output.text("Parsing Finals LS...");
+
+const competitorMap = new Map(); // key = normalized full name
+const finalsLsRoutineProfileLinks = new Map(); // finals ls record id -> Set(profile ids)
+
+function getOrCreateCompetitor(displayName) {
+    const cleanName = normalizeWhitespace(displayName);
+    const key = normalizeName(cleanName);
+    if (!competitorMap.has(key)) {
+        competitorMap.set(key, {
+            key,
+            fullName: cleanName,
+            competitorType: null,
+            baseEntryId: "",
+            ageDivision: "",
+            soloistRoutineIds: new Set(),
+            groupRoutineIds: new Set(),
+            finalsLsRecordIds: new Set(),
+            ensembleRegEntryIds: new Set(),
+            scholarshipRecordId: null,
+            scholarshipDob: "",
+            scholarshipProfileId: null,
+            competitorProfileId: null,
+            finalsInvitationIds: new Set(),
+            soloistRegEntryIds: new Set(),
+            buildStatus: CFG.VALUES.BUILD_STATUS.OK,
+            buildNotes: "",
+            idConflict: false,
+        });
+    }
+    return competitorMap.get(key);
+}
+
+const validFinalsLsRecords = [];
+for (const rec of finalsLsQuery.records) {
+    const entryIdRaw = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.FINALS_LS.ENTRY_ID));
+    if (!startsWithNumeric(entryIdRaw)) continue;
+    validFinalsLsRecords.push(rec);
+}
+
+for (const rec of validFinalsLsRecords) {
+    const entryIdRaw = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.FINALS_LS.ENTRY_ID));
+    const baseEntryId = normalizeSoloistEntryId(entryIdRaw);
+    const categoryNames = getMultiSelectNames(rec.getCellValue(CFG.FIELDS.FINALS_LS.PERFORMANCE_CATEGORY));
+    const competitorsRaw = normalizeCsvName(rec.getCellValueAsString(CFG.FIELDS.FINALS_LS.COMPETITORS));
+    const names = splitCompetitorNames(competitorsRaw);
+    const ageDivision = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.FINALS_LS.AGE_DIVISION));
+
+    const isSoloistRoutine = includesAny(categoryNames, CFG.PERFORMANCE_CATEGORY.SOLOIST);
+    const isGroupRoutine = includesAny(categoryNames, CFG.PERFORMANCE_CATEGORY.GROUP);
+
+    if (!names.length) {
+        console.log(`REVIEW: Finals LS record ${rec.id} has no competitors parsed. EntryID=${entryIdRaw}`);
+        continue;
+    }
+
+    finalsLsRoutineProfileLinks.set(rec.id, new Set());
+
+    if (isSoloistRoutine) {
+        const soloName = names[0];
+        const person = getOrCreateCompetitor(soloName);
+
+        person.competitorType = CFG.VALUES.COMPETITOR_TYPE.SOLOIST;
+        person.soloistRoutineIds.add(rec.id);
+        person.finalsLsRecordIds.add(rec.id);
+
+        if (!person.baseEntryId) {
+            person.baseEntryId = baseEntryId;
+        } else if (person.baseEntryId !== baseEntryId) {
+            person.idConflict = true;
+            person.buildStatus = CFG.VALUES.BUILD_STATUS.ID_CONFLICT;
+            person.buildNotes = appendNote(
+                person.buildNotes,
+                `Conflicting soloist EntryIDs in Finals LS: existing ${person.baseEntryId}, new ${baseEntryId}`
+            );
+            console.log(`REVIEW: ID conflict for ${person.fullName} in Finals LS (${person.baseEntryId} vs ${baseEntryId})`);
+        }
+
+        if (!person.ageDivision) {
+            person.ageDivision = ageDivision;
+        } else if (person.ageDivision !== ageDivision) {
+            person.buildStatus = CFG.VALUES.BUILD_STATUS.REVIEW;
+            person.buildNotes = appendNote(
+                person.buildNotes,
+                `Conflicting Age Division in Finals LS: existing ${person.ageDivision}, new ${ageDivision}`
+            );
+            console.log(`REVIEW: Age Division conflict for ${person.fullName} in Finals LS (${person.ageDivision} vs ${ageDivision})`);
+        }
+    }
+
+    if (isGroupRoutine) {
+        for (const name of names) {
+            const person = getOrCreateCompetitor(name);
+            person.groupRoutineIds.add(rec.id);
+            person.finalsLsRecordIds.add(rec.id);
+            if (!person.ageDivision) person.ageDivision = ageDivision;
+
+            addToMapSet(ensembleIdsByParticipantName, normalizeName(name), null); // noop safe pattern
+        }
+
+        // No roster-level group ID assignment here; ensemble links resolved later.
+    }
+}
+
+////////////////////////////////////////
+// FINALIZE COMPETITOR TYPES
+////////////////////////////////////////
+
+let tempCounter = 1;
+
+for (const person of competitorMap.values()) {
+    const isSoloist = person.soloistRoutineIds.size > 0;
+    const isGroupOnly = !isSoloist && person.groupRoutineIds.size > 0;
+
+    if (isSoloist) {
+        person.competitorType = CFG.VALUES.COMPETITOR_TYPE.SOLOIST;
+        person.baseEntryId = normalizeSoloistEntryId(person.baseEntryId);
+    } else if (isGroupOnly) {
+        person.competitorType = CFG.VALUES.COMPETITOR_TYPE.ENSEMBLE_ONLY;
+    }
+
+    if (!person.baseEntryId && person.competitorType === CFG.VALUES.COMPETITOR_TYPE.ENSEMBLE_ONLY) {
+        // defer until scholarship matching first
+    }
+}
+
+console.log(`Parsed ${competitorMap.size} unique competitors from Finals LS.`);
+
+////////////////////////////////////////
+// MATCH SCHOLARSHIP BOOK
+////////////////////////////////////////
+
+for (const person of competitorMap.values()) {
+    const normName = normalizeName(person.fullName);
+    let matchedScholarship = null;
+
+    if (person.competitorType === CFG.VALUES.COMPETITOR_TYPE.SOLOIST && person.baseEntryId) {
+        const candidatesById = scholarshipByNormalizedEntryId.get(person.baseEntryId) || [];
+        const exactNameMatches = candidatesById.filter(r =>
+            normalizeName(r.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.FULL_NAME)) === normName
+        );
+
+        if (exactNameMatches.length === 1) {
+            matchedScholarship = exactNameMatches[0];
+        } else if (exactNameMatches.length > 1) {
+            person.buildStatus = CFG.VALUES.BUILD_STATUS.REVIEW;
+            person.buildNotes = appendNote(person.buildNotes, "Multiple Scholarship Book matches by EntryID + Full Name.");
+            console.log(`REVIEW: Multiple Scholarship Book matches for soloist ${person.fullName} (${person.baseEntryId})`);
+        } else if (candidatesById.length) {
+            const candidateNames = candidatesById.map(r => r.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.FULL_NAME));
+            person.buildStatus = CFG.VALUES.BUILD_STATUS.ID_CONFLICT;
+            person.buildNotes = appendNote(
+                person.buildNotes,
+                `Scholarship Book EntryID matched but name mismatch. Finals LS name: ${person.fullName}; Scholarship names: ${candidateNames.join(", ")}`
+            );
+            console.log(`REVIEW: Scholarship EntryID/name mismatch for ${person.fullName} (${person.baseEntryId})`);
+        }
+    }
+
+    if (!matchedScholarship) {
+        const exactNameMatches = scholarshipByExactName.get(normName) || [];
+        if (exactNameMatches.length === 1) {
+            matchedScholarship = exactNameMatches[0];
+
+            if (
+                person.competitorType === CFG.VALUES.COMPETITOR_TYPE.SOLOIST &&
+                person.baseEntryId
+            ) {
+                const scholarshipEntryId = normalizeSoloistEntryId(
+                    matchedScholarship.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.ENTRY_ID)
+                );
+                if (scholarshipEntryId && scholarshipEntryId !== person.baseEntryId) {
+                    person.buildStatus = CFG.VALUES.BUILD_STATUS.ID_CONFLICT;
+                    person.buildNotes = appendNote(
+                        person.buildNotes,
+                        `Same name matched Scholarship Book but EntryIDs differ: Finals LS ${person.baseEntryId}, Scholarship ${scholarshipEntryId}`
+                    );
+                    console.log(`REVIEW: Same-name different-ID conflict for ${person.fullName}`);
+                }
+            }
+        } else if (exactNameMatches.length > 1) {
+            person.buildStatus =
+                person.buildStatus === CFG.VALUES.BUILD_STATUS.OK
+                    ? CFG.VALUES.BUILD_STATUS.REVIEW
+                    : person.buildStatus;
+            person.buildNotes = appendNote(person.buildNotes, "Multiple Scholarship Book matches by Full Name.");
+            console.log(`REVIEW: Multiple Scholarship Book name matches for ${person.fullName}`);
+        }
+    }
+
+    if (matchedScholarship) {
+        person.scholarshipRecordId = matchedScholarship.id;
+        person.scholarshipDob = normalizeDateKey(matchedScholarship.getCellValue(CFG.FIELDS.SCHOLARSHIP.DOB));
+        const scholarshipProfileId = firstOrNull(uniqueRecordIdsFromLinkedCell(
+            matchedScholarship.getCellValue(CFG.FIELDS.SCHOLARSHIP.COMPETITOR_PROFILE)
+        ));
+        if (scholarshipProfileId) person.scholarshipProfileId = scholarshipProfileId;
+
+        if (person.competitorType === CFG.VALUES.COMPETITOR_TYPE.ENSEMBLE_ONLY) {
+            const scholarshipEntryIdRaw = normalizeWhitespace(
+                matchedScholarship.getCellValueAsString(CFG.FIELDS.SCHOLARSHIP.ENTRY_ID)
+            );
+            let ensembleEntryId = scholarshipEntryIdRaw;
+            if (ensembleEntryId && !/xs$/i.test(ensembleEntryId)) {
+                ensembleEntryId = `${normalizeSoloistEntryId(ensembleEntryId)}xs`;
+            }
+            if (ensembleEntryId) person.baseEntryId = ensembleEntryId;
+        }
+    } else {
+        if (person.competitorType === CFG.VALUES.COMPETITOR_TYPE.ENSEMBLE_ONLY) {
+            person.buildStatus =
+                person.buildStatus === CFG.VALUES.BUILD_STATUS.OK
+                    ? CFG.VALUES.BUILD_STATUS.MISSING_SCHOLARSHIP_MATCH
+                    : person.buildStatus;
+            person.buildNotes = appendNote(person.buildNotes, "No Scholarship Book match found for ensemble-only competitor.");
+        }
+    }
+
+    if (!person.baseEntryId && person.competitorType === CFG.VALUES.COMPETITOR_TYPE.ENSEMBLE_ONLY) {
+        person.baseEntryId = buildTempEntryId(tempCounter++);
+        person.buildNotes = appendNote(person.buildNotes, `Assigned temporary ensemble EntryID: ${person.baseEntryId}`);
+    }
+}
+
+////////////////////////////////////////
+// MATCH / CREATE COMPETITOR PROFILES
+////////////////////////////////////////
+
+const profilesToCreate = [];
+const personKeyToCreatedProfileSeed = new Map();
+
+for (const person of competitorMap.values()) {
+    let matchedProfile = null;
+
+    if (person.scholarshipProfileId) {
+        const directProfile = profilesQuery.getRecord(person.scholarshipProfileId);
+        if (directProfile) matchedProfile = directProfile;
+    }
+
+    if (!matchedProfile && person.scholarshipDob) {
+        const candidates = profilesByNameDob.get(makeNameDobKey(person.fullName, person.scholarshipDob)) || [];
+        if (candidates.length === 1) {
+            matchedProfile = candidates[0];
+        } else if (candidates.length > 1) {
+            person.buildStatus = CFG.VALUES.BUILD_STATUS.REVIEW;
+            person.buildNotes = appendNote(person.buildNotes, "Multiple Competitor Profiles matched by Full Name + DOB.");
+            console.log(`REVIEW: Multiple profile matches for ${person.fullName} by name + DOB.`);
+        }
+    }
+
+    if (!matchedProfile && person.competitorType === CFG.VALUES.COMPETITOR_TYPE.SOLOIST) {
+        const singleNameCandidates = profilesByName.get(normalizeName(person.fullName)) || [];
+        if (singleNameCandidates.length === 1) {
+            matchedProfile = singleNameCandidates[0];
+            person.buildStatus =
+                person.buildStatus === CFG.VALUES.BUILD_STATUS.OK
+                    ? CFG.VALUES.BUILD_STATUS.REVIEW
+                    : person.buildStatus;
+            person.buildNotes = appendNote(person.buildNotes, "Profile matched by Full Name only; verify DOB manually.");
+            console.log(`REVIEW: ${person.fullName} matched profile by name only.`);
+        } else if (singleNameCandidates.length > 1) {
+            person.buildStatus = CFG.VALUES.BUILD_STATUS.REVIEW;
+            person.buildNotes = appendNote(person.buildNotes, "Multiple Competitor Profiles matched by Full Name only.");
+            console.log(`REVIEW: Multiple name-only profile matches for ${person.fullName}`);
+        }
+    }
+
+    if (matchedProfile) {
+        person.competitorProfileId = matchedProfile.id;
+        continue;
+    }
+
+    // Create missing profile
+    person.buildStatus =
+        person.buildStatus === CFG.VALUES.BUILD_STATUS.OK
+            ? CFG.VALUES.BUILD_STATUS.MISSING_PROFILE
+            : person.buildStatus;
+    person.buildNotes = appendNote(person.buildNotes, "Created new Competitor Profile.");
+
+    const fields = {};
+    fields[CFG.FIELDS.PROFILES.FULL_NAME] = person.fullName;
+    fields[CFG.FIELDS.PROFILES.STATUS] = { name: CFG.VALUES.PROFILE_STATUS.NEW };
+    fields[CFG.FIELDS.PROFILES.COMPETITOR_TYPE] = { name: person.competitorType };
+
+    if (person.scholarshipDob) {
+        fields[CFG.FIELDS.PROFILES.DOB] = person.scholarshipDob;
+    }
+
+    profilesToCreate.push({ fields, __personKey: person.key });
+    personKeyToCreatedProfileSeed.set(person.key, true);
+}
+
+if (profilesToCreate.length) {
+    const createPayloads = profilesToCreate.map(({ fields }) => ({ fields }));
+    await batchCreateRecords(profilesTable, createPayloads, "Competitor Profiles");
+}
+
+if (profilesToCreate.length) {
+    // Re-query profiles to recover newly created IDs reliably
+    const profilesQueryAfterCreate = await profilesTable.selectRecordsAsync();
+
+    const refreshedProfilesByNameDob = new Map();
+    const refreshedProfilesByName = new Map();
+
+    for (const rec of profilesQueryAfterCreate.records) {
+        const name = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.PROFILES.FULL_NAME));
+        const dob = rec.getCellValue(CFG.FIELDS.PROFILES.DOB);
+        const normName = normalizeName(name);
+        const key = makeNameDobKey(name, dob);
+
+        if (normName) {
+            if (!refreshedProfilesByName.has(normName)) refreshedProfilesByName.set(normName, []);
+            refreshedProfilesByName.get(normName).push(rec);
+        }
+
+        if (normName && normalizeDateKey(dob)) {
+            if (!refreshedProfilesByNameDob.has(key)) refreshedProfilesByNameDob.set(key, []);
+            refreshedProfilesByNameDob.get(key).push(rec);
+        }
+    }
+
+    for (const person of competitorMap.values()) {
+        if (person.competitorProfileId) continue;
+
+        let matchedCreated = null;
+
+        if (person.scholarshipDob) {
+            const candidates = refreshedProfilesByNameDob.get(makeNameDobKey(person.fullName, person.scholarshipDob)) || [];
+            const newCandidates = candidates.filter(r =>
+                r.getCellValueAsString(CFG.FIELDS.PROFILES.STATUS) === CFG.VALUES.PROFILE_STATUS.NEW
+            );
+            if (newCandidates.length === 1) {
+                matchedCreated = newCandidates[0];
+            }
+        }
+
+        if (!matchedCreated) {
+            const candidates = refreshedProfilesByName.get(normalizeName(person.fullName)) || [];
+            const newCandidates = candidates.filter(r =>
+                r.getCellValueAsString(CFG.FIELDS.PROFILES.STATUS) === CFG.VALUES.PROFILE_STATUS.NEW
+            );
+            if (newCandidates.length === 1) matchedCreated = newCandidates[0];
+        }
+
+        if (matchedCreated) {
+            person.competitorProfileId = matchedCreated.id;
+        } else {
+            console.log(`REVIEW: Could not reliably recover created profile ID for ${person.fullName}`);
+        }
+    }
+}
+
+////////////////////////////////////////
+// DERIVE FINAL LINKS
+////////////////////////////////////////
+
+for (const person of competitorMap.values()) {
+    // Finals Invitations
+    if (person.competitorProfileId && invitationsByProfileId.has(person.competitorProfileId)) {
+        addManyToMapSet(person.finalsInvitationIds, "__self__", [...invitationsByProfileId.get(person.competitorProfileId)]);
+    } else if (invitationsByName.has(person.key)) {
+        addManyToMapSet(person.finalsInvitationIds, "__self__", [...invitationsByName.get(person.key)]);
+    }
+
+    if (person.finalsInvitationIds instanceof Map) {
+        // safety no-op
+    }
+
+    // Regionals
+    if (person.competitorType === CFG.VALUES.COMPETITOR_TYPE.SOLOIST) {
+        if (person.competitorProfileId && regionalsByProfileId.has(person.competitorProfileId)) {
+            for (const regionalId of regionalsByProfileId.get(person.competitorProfileId)) {
+                person.soloistRegEntryIds.add(regionalId);
+            }
+        } else if (person.scholarshipDob) {
+            const key = makeNameDobKey(person.fullName, person.scholarshipDob);
+            const regionals = regionalsByNameDob.get(key) || new Set();
+            for (const regionalId of regionals) person.soloistRegEntryIds.add(regionalId);
+        }
+    }
+
+    // Ensembles
+    if (person.groupRoutineIds.size > 0) {
+        const ensembleIds = ensembleIdsByParticipantName.get(person.key) || new Set();
+        for (const ensembleId of ensembleIds) {
+            if (ensembleId) person.ensembleRegEntryIds.add(ensembleId);
+        }
+    }
+}
+
+// Fix finalsInvitationIds structure if helper above didn't apply due to Set usage
+for (const person of competitorMap.values()) {
+    if (!(person.finalsInvitationIds instanceof Set)) {
+        person.finalsInvitationIds = new Set();
+    }
+
+    if (person.competitorProfileId && invitationsByProfileId.has(person.competitorProfileId)) {
+        for (const invitationId of invitationsByProfileId.get(person.competitorProfileId)) {
+            person.finalsInvitationIds.add(invitationId);
+        }
+    } else if (invitationsByName.has(person.key)) {
+        for (const invitationId of invitationsByName.get(person.key)) {
+            person.finalsInvitationIds.add(invitationId);
+        }
+    }
+}
+
+////////////////////////////////////////
+// BUILD / UPDATE FINALS ROSTER
+////////////////////////////////////////
+
+const finalsRosterCreates = [];
+const finalsRosterUpdates = [];
+const personKeyToRosterRecordId = new Map();
+
+for (const person of competitorMap.values()) {
+    const fields = {};
+
+    fields[CFG.FIELDS.FINALS_ROSTER.ENTRY_ID] = person.baseEntryId || "";
+    fields[CFG.FIELDS.FINALS_ROSTER.COMPETITOR_TYPE] = { name: person.competitorType };
+    fields[CFG.FIELDS.FINALS_ROSTER.FULL_NAME] = person.fullName;
+    if (person.ageDivision) {
+        fields[CFG.FIELDS.FINALS_ROSTER.AGE_DIVISION] = { name: person.ageDivision };
+    }
+
+    if (person.competitorProfileId) {
+        fields[CFG.FIELDS.FINALS_ROSTER.COMPETITOR_PROFILE] = linkedRecordArray([person.competitorProfileId]);
+    }
+    if (person.scholarshipRecordId) {
+        fields[CFG.FIELDS.FINALS_ROSTER.SCHOLARSHIP_BOOK_INFO] = linkedRecordArray([person.scholarshipRecordId]);
+    }
+    if (person.soloistRegEntryIds.size) {
+        fields[CFG.FIELDS.FINALS_ROSTER.SOLOIST_REG_ENTRY_ID] = linkedRecordArray([...person.soloistRegEntryIds]);
+    }
+    if (person.ensembleRegEntryIds.size) {
+        fields[CFG.FIELDS.FINALS_ROSTER.ENSEMBLE_REG_ENTRY_ID] = linkedRecordArray([...person.ensembleRegEntryIds]);
+    }
+    if (person.finalsInvitationIds.size) {
+        fields[CFG.FIELDS.FINALS_ROSTER.FINALS_INVITATION] = linkedRecordArray([...person.finalsInvitationIds]);
+    }
+
+    fields[CFG.FIELDS.FINALS_ROSTER.BUILD_STATUS] = { name: person.buildStatus };
+    fields[CFG.FIELDS.FINALS_ROSTER.BUILD_NOTES] = person.buildNotes || "";
+
+    let existing = null;
+    if (person.baseEntryId && finalsRosterByEntryId.has(person.baseEntryId)) {
+        existing = finalsRosterByEntryId.get(person.baseEntryId);
+    } else if (finalsRosterByName.has(person.key)) {
+        existing = finalsRosterByName.get(person.key);
+    }
+
+    if (existing) {
+        finalsRosterUpdates.push({
+            id: existing.id,
+            fields,
+        });
+        personKeyToRosterRecordId.set(person.key, existing.id);
+    } else {
+        finalsRosterCreates.push({
+            fields,
+            __personKey: person.key,
+        });
+    }
+}
+
+if (finalsRosterCreates.length) {
+    await batchCreateRecords(
+        finalsRosterTable,
+        finalsRosterCreates.map(x => ({ fields: x.fields })),
+        "Finals Roster records"
+    );
+}
+
+if (finalsRosterUpdates.length) {
+    await batchUpdateRecords(finalsRosterTable, finalsRosterUpdates, "Finals Roster records");
+}
+
+if (finalsRosterCreates.length) {
+    const finalsRosterQueryAfterCreate = await finalsRosterTable.selectRecordsAsync();
+    for (const rec of finalsRosterQueryAfterCreate.records) {
+        const entryId = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.FINALS_ROSTER.ENTRY_ID));
+        const fullName = normalizeWhitespace(rec.getCellValueAsString(CFG.FIELDS.FINALS_ROSTER.FULL_NAME));
+        const normName = normalizeName(fullName);
+        if (entryId) finalsRosterByEntryId.set(entryId, rec);
+        if (normName && !finalsRosterByName.has(normName)) finalsRosterByName.set(normName, rec);
+    }
+
+    for (const person of competitorMap.values()) {
+        if (personKeyToRosterRecordId.has(person.key)) continue;
+
+        let rosterRec = null;
+        if (person.baseEntryId && finalsRosterByEntryId.has(person.baseEntryId)) {
+            rosterRec = finalsRosterByEntryId.get(person.baseEntryId);
+        } else if (finalsRosterByName.has(person.key)) {
+            rosterRec = finalsRosterByName.get(person.key);
+        }
+
+        if (rosterRec) personKeyToRosterRecordId.set(person.key, rosterRec.id);
+    }
+}
+
+////////////////////////////////////////
+// WRITE BACK PROFILE LINKS TO FINALS LS
+////////////////////////////////////////
+
+for (const rec of validFinalsLsRecords) {
+    const categoryNames = getMultiSelectNames(rec.getCellValue(CFG.FIELDS.FINALS_LS.PERFORMANCE_CATEGORY));
+    const competitorNames = splitCompetitorNames(rec.getCellValueAsString(CFG.FIELDS.FINALS_LS.COMPETITORS));
+    const linkedProfileIds = new Set();
+
+    const isSoloistRoutine = includesAny(categoryNames, CFG.PERFORMANCE_CATEGORY.SOLOIST);
+    const isGroupRoutine = includesAny(categoryNames, CFG.PERFORMANCE_CATEGORY.GROUP);
+
+    if (isSoloistRoutine && competitorNames.length) {
+        const person = competitorMap.get(normalizeName(competitorNames[0]));
+        if (person?.competitorProfileId) linkedProfileIds.add(person.competitorProfileId);
+    }
+
+    if (isGroupRoutine) {
+        for (const name of competitorNames) {
+            const person = competitorMap.get(normalizeName(name));
+            if (person?.competitorProfileId) linkedProfileIds.add(person.competitorProfileId);
+        }
+    }
+
+    finalsLsRoutineProfileLinks.set(rec.id, linkedProfileIds);
+}
+
+const finalsLsUpdates = [];
+for (const [recordId, profileIdSet] of finalsLsRoutineProfileLinks.entries()) {
+    finalsLsUpdates.push({
+        id: recordId,
+        fields: {
+            [CFG.FIELDS.FINALS_LS.COMPETITOR_PROFILES]: linkedRecordArray([...profileIdSet]),
+        },
+    });
+}
+
+if (finalsLsUpdates.length) {
+    await batchUpdateRecords(finalsLsTable, finalsLsUpdates, "Finals LS profile link updates");
+}
+
+////////////////////////////////////////
+// SUMMARY
+////////////////////////////////////////
+
+let soloistCount = 0;
+let ensembleOnlyCount = 0;
+let reviewCount = 0;
+let missingProfileCount = 0;
+
+for (const person of competitorMap.values()) {
+    if (person.competitorType === CFG.VALUES.COMPETITOR_TYPE.SOLOIST) soloistCount++;
+    if (person.competitorType === CFG.VALUES.COMPETITOR_TYPE.ENSEMBLE_ONLY) ensembleOnlyCount++;
+    if (person.buildStatus === CFG.VALUES.BUILD_STATUS.REVIEW || person.buildStatus === CFG.VALUES.BUILD_STATUS.ID_CONFLICT || person.buildStatus === CFG.VALUES.BUILD_STATUS.DOB_CONFLICT) reviewCount++;
+    if (!person.competitorProfileId) missingProfileCount++;
+}
+
+output.markdown(`### Complete`);
+output.text(`Unique competitors processed: ${competitorMap.size}`);
+output.text(`Soloists: ${soloistCount}`);
+output.text(`Ensemble only: ${ensembleOnlyCount}`);
+output.text(`Records flagged for review: ${reviewCount}`);
+output.text(`Profiles without linked ID after run: ${missingProfileCount}`);
+
+console.log("FIN-1-RosterGeneration-v1.0.26 completed.");
+console.log(`Processed competitors: ${competitorMap.size}`);
+console.log(`Soloists: ${soloistCount}`);
+console.log(`Ensemble only: ${ensembleOnlyCount}`);
+console.log(`Review count: ${reviewCount}`);
+console.log(`Missing profile count after run: ${missingProfileCount}`);
