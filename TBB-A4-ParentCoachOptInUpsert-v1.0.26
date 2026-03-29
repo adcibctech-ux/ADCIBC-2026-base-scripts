@@ -1,0 +1,200 @@
+/**
+ * TBB-A4-ParentCoachOptInUpsert-v1.0.26
+ * Upsert a Finals parent/coach into Finals Text Blast Build from a Parent/Coach Profiles record
+ *
+ * BEHAVIOR:
+ * - Runs on one {Parent/Coach Profiles} record
+ * - Reads {Competitor(s)} links on the parent/coach profile
+ * - Checks whether any linked competitor is a finalist via {Finals Roster}
+ * - If parent/coach is opted in and linked to at least one finalist:
+ *      upserts into {Finals Text Blast Build}
+ * - If not qualified:
+ *      removes matching staging record only if it belongs to that parent/coach source record
+ * - Role mapping:
+ *      PARENT -> PARENT
+ *      COACH  -> COACH
+ *
+ * BUG FIXES:
+ * - N/A
+ */
+
+const CONFIG = {
+  parentCoachProfilesTableName: "Parent/Coach Profiles",
+  competitorProfilesTableName: "Competitor Profiles",
+  stagingTableName: "Finals Text Blast Build",
+
+  inputRecordIdVar: "recordId",
+
+  parentCoachFields: {
+    fullName: "Full Name",
+    phone: "Parent/Coach Phone Number",
+    role: "Role",
+    optIn: "Text Alerts OPT IN",
+    competitors: "Competitor(s)",
+  },
+
+  competitorFields: {
+    finalsRoster: "Finals Roster",
+  },
+
+  stagingFields: {
+    name: "Name",
+    phone: "Phone Number",
+    affiliation: "Affiliation",
+    source: "Source",
+    sourceRecordId: "Source Record ID",
+    uniqueKey: "Unique Key",
+    active: "Active",
+  },
+};
+
+function normalizePhone(value) {
+  if (!value) return "";
+  const digits = String(value).replace(/\D/g, "");
+  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
+  return digits;
+}
+
+function normalizeOptIn(value) {
+  if (value === null || value === undefined) return false;
+
+  if (Array.isArray(value)) {
+    return value.some(v => normalizeOptIn(v));
+  }
+
+  if (typeof value === "object") {
+    if ("name" in value) return String(value.name ?? "").trim().toUpperCase() === "YES";
+    if ("text" in value) return String(value.text ?? "").trim().toUpperCase() === "YES";
+  }
+
+  const str = String(value).trim().toUpperCase();
+  return ["YES", "TRUE", "1", "CHECKED"].includes(str);
+}
+
+function normalizeRole(value) {
+  if (value === null || value === undefined) return "";
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const normalized = normalizeRole(item);
+      if (normalized) return normalized;
+    }
+    return "";
+  }
+
+  let str = "";
+
+  if (typeof value === "object") {
+    if ("name" in value) str = String(value.name ?? "");
+    else if ("text" in value) str = String(value.text ?? "");
+    else str = String(value);
+  } else {
+    str = String(value);
+  }
+
+  str = str.trim().toUpperCase();
+
+  if (str.includes("PARENT")) return "PARENT";
+  if (str.includes("COACH")) return "COACH";
+  return "";
+}
+
+function coerceString(value) {
+  if (value === null || value === undefined) return "";
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "";
+    return coerceString(value[0]);
+  }
+  if (typeof value === "object") {
+    if ("name" in value) return String(value.name ?? "");
+    if ("text" in value) return String(value.text ?? "");
+  }
+  return String(value);
+}
+
+async function main() {
+  console.log("TBB-A4-ParentCoachOptInUpsert-v1.0.26");
+
+  const { recordId } = input.config();
+  if (!recordId) throw new Error("Missing input variable: recordId");
+
+  const parentCoachTable = base.getTable(CONFIG.parentCoachProfilesTableName);
+  const competitorTable = base.getTable(CONFIG.competitorProfilesTableName);
+  const stagingTable = base.getTable(CONFIG.stagingTableName);
+
+  const parentCoachQuery = await parentCoachTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.parentCoachFields),
+  });
+
+  const competitorQuery = await competitorTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.competitorFields),
+  });
+
+  const stagingQuery = await stagingTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.stagingFields),
+  });
+
+  const parentCoachRecord = parentCoachQuery.getRecord(recordId);
+  if (!parentCoachRecord) throw new Error(`Parent/Coach Profiles record not found: ${recordId}`);
+
+  const linkedCompetitors = parentCoachRecord.getCellValue(CONFIG.parentCoachFields.competitors) || [];
+  let isLinkedToFinalist = false;
+
+  for (const linked of linkedCompetitors) {
+    const competitorRecord = competitorQuery.getRecord(linked.id);
+    if (!competitorRecord) continue;
+
+    const finalsRosterLinks = competitorRecord.getCellValue(CONFIG.competitorFields.finalsRoster) || [];
+    if (finalsRosterLinks.length > 0) {
+      isLinkedToFinalist = true;
+      break;
+    }
+  }
+
+  const optedIn = normalizeOptIn(parentCoachRecord.getCellValue(CONFIG.parentCoachFields.optIn));
+  const role = normalizeRole(parentCoachRecord.getCellValue(CONFIG.parentCoachFields.role));
+  const phone = normalizePhone(parentCoachRecord.getCellValue(CONFIG.parentCoachFields.phone));
+  const name = coerceString(parentCoachRecord.getCellValue(CONFIG.parentCoachFields.fullName)).trim();
+
+  const sourceRecordId = parentCoachRecord.id;
+  const source = "FINALS ROSTER";
+
+  let existing = null;
+  for (const rec of stagingQuery.records) {
+    const recSourceId = coerceString(rec.getCellValue(CONFIG.stagingFields.sourceRecordId)).trim();
+    const recAffiliation = coerceString(rec.getCellValue(CONFIG.stagingFields.affiliation)?.name || rec.getCellValue(CONFIG.stagingFields.affiliation)).trim().toUpperCase();
+    if (recSourceId === sourceRecordId && ["PARENT", "COACH"].includes(recAffiliation)) {
+      existing = rec;
+      break;
+    }
+  }
+
+  if (isLinkedToFinalist && optedIn && role && phone.length === 10) {
+    const fields = {
+      [CONFIG.stagingFields.name]: name,
+      [CONFIG.stagingFields.phone]: phone,
+      [CONFIG.stagingFields.affiliation]: { name: role },
+      [CONFIG.stagingFields.source]: { name: source },
+      [CONFIG.stagingFields.sourceRecordId]: sourceRecordId,
+      [CONFIG.stagingFields.uniqueKey]: phone,
+      [CONFIG.stagingFields.active]: true,
+    };
+
+    if (existing) {
+      await stagingTable.updateRecordAsync(existing.id, fields);
+      console.log(`Updated ${role} staging record for ${name}`);
+    } else {
+      await stagingTable.createRecordAsync(fields);
+      console.log(`Created ${role} staging record for ${name}`);
+    }
+  } else {
+    if (existing) {
+      await stagingTable.deleteRecordAsync(existing.id);
+      console.log(`Deleted parent/coach staging record for ${name} because they no longer qualify.`);
+    } else {
+      console.log("Parent/coach does not qualify and no existing staging record needed deletion.");
+    }
+  }
+}
+
+await main();
