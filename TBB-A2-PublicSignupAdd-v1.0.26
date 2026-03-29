@@ -1,0 +1,106 @@
+/**
+ * TBB-A2-PublicSignupAdd-v1.0.26
+ * Add/update eligible public signup records into TEXT ALERTS
+ *
+ * BEHAVIOR:
+ * - Runs on one TEXT PUB SIGNUPS record already marked READY TO ADD
+ * - Upserts into TEXT ALERTS by Normalized Phone / Unique Key
+ * - Writes:
+ *      Affiliation = OTHER
+ *      Source = PUBLIC SIGNUP
+ *      Active = true
+ * - Marks signup record as PROCESSED after success
+ *
+ * BUG FIXES:
+ * - N/A
+ */
+
+const CONFIG = {
+  signupTableName: "TEXT PUB SIGNUPS",
+  alertsTableName: "TEXT ALERTS",
+
+  inputRecordIdVar: "recordId",
+
+  signupFields: {
+    name: "Name",
+    normalizedPhone: "Normalized Phone",
+    processingStatus: "Processing Status",
+    processingNotes: "Processing Notes",
+  },
+
+  alertFields: {
+    name: "Name",
+    phone: "Phone Number",
+    affiliation: "Affiliation",
+    source: "Source",
+    sourceRecordId: "Source Record ID",
+    uniqueKey: "Unique Key",
+    active: "Active",
+  },
+};
+
+async function main() {
+  const { recordId } = input.config();
+  if (!recordId) throw new Error("Missing input variable: recordId");
+
+  const signupTable = base.getTable(CONFIG.signupTableName);
+  const alertsTable = base.getTable(CONFIG.alertsTableName);
+
+  const signupQuery = await signupTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.signupFields),
+  });
+
+  const alertsQuery = await alertsTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.alertFields),
+  });
+
+  const signup = signupQuery.getRecord(recordId);
+  if (!signup) throw new Error(`Signup record not found: ${recordId}`);
+
+  const status = signup.getCellValue(CONFIG.signupFields.processingStatus)?.name || "";
+  if (status !== "READY TO ADD") return;
+
+  const phone = String(signup.getCellValue(CONFIG.signupFields.normalizedPhone) || "").trim();
+  const name = String(signup.getCellValue(CONFIG.signupFields.name) || "").trim();
+
+  if (!phone) {
+    await signupTable.updateRecordAsync(recordId, {
+      [CONFIG.signupFields.processingStatus]: { name: "ERROR" },
+      [CONFIG.signupFields.processingNotes]: "READY TO ADD record had no normalized phone.",
+    });
+    return;
+  }
+
+  let existing = null;
+  for (const rec of alertsQuery.records) {
+    const key = String(rec.getCellValue(CONFIG.alertFields.uniqueKey) || "").trim();
+    const recPhone = String(rec.getCellValue(CONFIG.alertFields.phone) || "").replace(/\D/g, "");
+    if (key === phone || recPhone === phone) {
+      existing = rec;
+      break;
+    }
+  }
+
+  const fields = {
+    [CONFIG.alertFields.name]: name,
+    [CONFIG.alertFields.phone]: phone,
+    [CONFIG.alertFields.affiliation]: { name: "OTHER" },
+    [CONFIG.alertFields.source]: "PUBLIC SIGNUP",
+    [CONFIG.alertFields.sourceRecordId]: recordId,
+    [CONFIG.alertFields.uniqueKey]: phone,
+    [CONFIG.alertFields.active]: true,
+  };
+
+  if (existing) {
+    await alertsTable.updateRecordAsync(existing.id, fields);
+  } else {
+    await alertsTable.createRecordAsync(fields);
+  }
+
+  await signupTable.updateRecordAsync(recordId, {
+    [CONFIG.signupFields.processingStatus]: { name: "PROCESSED" },
+    [CONFIG.signupFields.processingNotes]: "Added/updated in TEXT ALERTS as OTHER via PUBLIC SIGNUP.",
+  });
+}
+
+await main();
