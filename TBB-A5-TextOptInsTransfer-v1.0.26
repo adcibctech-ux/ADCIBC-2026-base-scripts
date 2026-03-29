@@ -1,0 +1,198 @@
+/**
+ * TBB-A5-TextOptInsTransfer-v1.0.26
+ * Transfer synced TEXT OPT INS records into TEXT ALERTS
+ *
+ * BEHAVIOR:
+ * - Runs on one record from {TEXT OPT INS}
+ * - Intended trigger: when record enters view {TO PROCESS}
+ * - Skips records where:
+ *      {Active} is not checked
+ *      {Unique Key} is blank
+ *      {Phone Number} is blank/invalid
+ * - Upserts into {TEXT ALERTS} using:
+ *      {Unique Key} as primary dedupe key
+ *      fallback = normalized {Phone Number}
+ * - Writes:
+ *      {Name}
+ *      {Phone Number}
+ *      {Affiliation}
+ *      {Source}
+ *      {Source Record ID}
+ *      {Unique Key}
+ *      {Active}
+ * - After successful create/update in {TEXT ALERTS},
+ *      checks {Transferred to TEXT ALERTS} in {TEXT OPT INS}
+ *
+ * BUG FIXES:
+ * - N/A
+ */
+
+const CONFIG = {
+  sourceTableName: "TEXT OPT INS",
+  destinationTableName: "TEXT ALERTS",
+
+  inputRecordIdVar: "recordId",
+
+  sourceFields: {
+    name: "Name",
+    phone: "Phone Number",
+    affiliation: "Affiliation",
+    source: "Source",
+    sourceRecordId: "Source Record ID",
+    uniqueKey: "Unique Key",
+    active: "Active",
+    transferred: "Transferred to TEXT ALERTS",
+  },
+
+  destinationFields: {
+    name: "Name",
+    phone: "Phone Number",
+    affiliation: "Affiliation",
+    source: "Source",
+    sourceRecordId: "Source Record ID",
+    uniqueKey: "Unique Key",
+    active: "Active",
+  },
+};
+
+function normalizePhone(value) {
+  if (!value) return "";
+  const digits = String(value).replace(/\D/g, "");
+  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
+  return digits;
+}
+
+function coerceString(value) {
+  if (value === null || value === undefined) return "";
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "";
+    return coerceString(value[0]);
+  }
+  if (typeof value === "object") {
+    if ("name" in value) return String(value.name ?? "");
+    if ("text" in value) return String(value.text ?? "");
+  }
+  return String(value);
+}
+
+function getSingleSelectName(value) {
+  if (!value) return "";
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "";
+    return getSingleSelectName(value[0]);
+  }
+  if (typeof value === "object" && "name" in value) {
+    return String(value.name ?? "");
+  }
+  return String(value);
+}
+
+async function main() {
+  console.log("TBB-A5-TextOptInsTransfer-v1.0.26");
+
+  const { recordId } = input.config();
+  if (!recordId) throw new Error("Missing input variable: recordId");
+
+  const sourceTable = base.getTable(CONFIG.sourceTableName);
+  const destinationTable = base.getTable(CONFIG.destinationTableName);
+
+  const sourceQuery = await sourceTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.sourceFields),
+  });
+
+  const destinationQuery = await destinationTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.destinationFields),
+  });
+
+  const sourceRecord = sourceQuery.getRecord(recordId);
+  if (!sourceRecord) {
+    throw new Error(`TEXT OPT INS record not found: ${recordId}`);
+  }
+
+  const active = !!sourceRecord.getCellValue(CONFIG.sourceFields.active);
+  if (!active) {
+    console.log("Skipped: source record is not active.");
+    return;
+  }
+
+  const uniqueKey = coerceString(
+    sourceRecord.getCellValue(CONFIG.sourceFields.uniqueKey)
+  ).trim();
+
+  const rawPhone = sourceRecord.getCellValue(CONFIG.sourceFields.phone);
+  const normalizedPhone = normalizePhone(rawPhone);
+
+  if (!uniqueKey) {
+    console.log("Skipped: Unique Key is blank.");
+    return;
+  }
+
+  if (normalizedPhone.length !== 10) {
+    console.log("Skipped: Phone Number is missing or invalid.");
+    return;
+  }
+
+  const name = coerceString(
+    sourceRecord.getCellValue(CONFIG.sourceFields.name)
+  ).trim();
+
+  const affiliation = getSingleSelectName(
+    sourceRecord.getCellValue(CONFIG.sourceFields.affiliation)
+  ).trim().toUpperCase();
+
+  const sourceName = getSingleSelectName(
+    sourceRecord.getCellValue(CONFIG.sourceFields.source)
+  ).trim() || "FINALS ROSTER";
+
+  const sourceRecordId = coerceString(
+    sourceRecord.getCellValue(CONFIG.sourceFields.sourceRecordId)
+  ).trim();
+
+  if (!affiliation) {
+    console.log("Skipped: Affiliation is blank.");
+    return;
+  }
+
+  let existing = null;
+
+  for (const rec of destinationQuery.records) {
+    const recUniqueKey = coerceString(
+      rec.getCellValue(CONFIG.destinationFields.uniqueKey)
+    ).trim();
+
+    const recPhone = normalizePhone(
+      rec.getCellValue(CONFIG.destinationFields.phone)
+    );
+
+    if (recUniqueKey === uniqueKey || (recPhone && recPhone === normalizedPhone)) {
+      existing = rec;
+      break;
+    }
+  }
+
+  const fields = {
+    [CONFIG.destinationFields.name]: name,
+    [CONFIG.destinationFields.phone]: normalizedPhone,
+    [CONFIG.destinationFields.affiliation]: { name: affiliation },
+    [CONFIG.destinationFields.source]: sourceName,
+    [CONFIG.destinationFields.sourceRecordId]: sourceRecordId,
+    [CONFIG.destinationFields.uniqueKey]: uniqueKey,
+    [CONFIG.destinationFields.active]: true,
+  };
+
+  if (existing) {
+    await destinationTable.updateRecordAsync(existing.id, fields);
+    console.log(`Updated TEXT ALERTS record for ${name || uniqueKey}`);
+  } else {
+    await destinationTable.createRecordAsync(fields);
+    console.log(`Created TEXT ALERTS record for ${name || uniqueKey}`);
+  }
+
+  await sourceTable.updateRecordAsync(sourceRecord.id, {
+    [CONFIG.sourceFields.transferred]: true,
+  });
+
+  console.log("Marked TEXT OPT INS record as transferred.");
+}
+
+await main();
