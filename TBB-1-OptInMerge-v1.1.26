@@ -1,5 +1,5 @@
 /**
- * TBB-1-OptInMerge-v1.0.26
+ * TBB-1-OptInMerge-v1.1.26
  * Build/refresh Finals Text Blast Build staging table from Finals-eligible opted-in records
  *
  * BEHAVIOR:
@@ -16,7 +16,8 @@
  * - Deletes staging records that no longer qualify
  *
  * BUG FIXES:
- * - N/A
+ * - Fixed single select parsing for {Text Alerts OPT IN}
+ * - Fixed single select parsing for {Role}
  */
 
 const CONFIG = {
@@ -68,12 +69,42 @@ function normalizeOptIn(value) {
     return value.some(v => normalizeOptIn(v));
   }
 
+  if (typeof value === "object") {
+    if ("name" in value) {
+      return String(value.name ?? "").trim().toUpperCase() === "YES";
+    }
+    if ("text" in value) {
+      return String(value.text ?? "").trim().toUpperCase() === "YES";
+    }
+  }
+
   const str = String(value).trim().toUpperCase();
   return ["YES", "TRUE", "1", "CHECKED"].includes(str);
 }
 
 function normalizeRole(value) {
-  const str = String(value || "").trim().toUpperCase();
+  if (value === null || value === undefined) return "";
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const normalized = normalizeRole(item);
+      if (normalized) return normalized;
+    }
+    return "";
+  }
+
+  let str = "";
+
+  if (typeof value === "object") {
+    if ("name" in value) str = String(value.name ?? "");
+    else if ("text" in value) str = String(value.text ?? "");
+    else str = String(value);
+  } else {
+    str = String(value);
+  }
+
+  str = str.trim().toUpperCase();
+
   if (str.includes("PARENT")) return "PARENT";
   if (str.includes("COACH")) return "COACH";
   return "";
@@ -116,7 +147,7 @@ function pickHigherPriority(existing, incoming) {
 }
 
 async function main() {
-  console.log("TBB-1-OptInMerge-v1.0.26");
+  console.log("TBB-1-OptInMerge-v1.0.27");
   output.text("Loading records...");
 
   const finalsRosterTable = base.getTable(CONFIG.finalsRosterTableName);
