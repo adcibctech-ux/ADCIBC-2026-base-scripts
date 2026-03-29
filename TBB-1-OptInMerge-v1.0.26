@@ -6,8 +6,9 @@
  * - Reads Finals Roster and finds linked Competitor Profiles
  * - Includes competitor if:
  *      {Text Alerts OPT IN} == YES
- * - Includes linked parent/coach entries if lookup arrays indicate:
- *      {Parent/Coach Text Alerts OPT IN} == YES
+ * - Reads linked Parent/Coach Profiles directly from the Parent/Coach Profiles table
+ * - Includes linked parent/coach if:
+ *      {Text Alerts OPT IN} == YES
  * - Dedupe key is normalized phone number
  * - Within this staging table, affiliation priority is:
  *      COMPETITOR > PARENT > COACH
@@ -21,19 +22,20 @@
 const CONFIG = {
   finalsRosterTableName: "Finals Roster",
   competitorProfilesTableName: "Competitor Profiles",
+  parentCoachProfilesTableName: "Parent/Coach Profiles",
   stagingTableName: "Finals Text Blast Build",
 
   finalsRosterToCompetitorField: "Competitor Profile",
 
-  competitorFinalsRosterField: "Finals Roster",
   competitorNameField: "Full Name",
   competitorPhoneField: "Competitor Phone Number",
   competitorOptInField: "Text Alerts OPT IN",
+  competitorParentCoachLinkField: "Parent/Coach Profiles",
 
-  parentCoachNamesLookupField: "Parent/Coach Full Name",
-  parentCoachPhonesLookupField: "Parent/Coach Phone Number",
-  parentCoachRolesLookupField: "Parent/Coach Role",
-  parentCoachOptInLookupField: "Parent/Coach Text Alerts OPT IN",
+  parentCoachNameField: "Full Name",
+  parentCoachPhoneField: "Parent/Coach Phone Number",
+  parentCoachRoleField: "Role",
+  parentCoachOptInField: "Text Alerts OPT IN",
 
   stagingFields: {
     name: "Name",
@@ -77,28 +79,12 @@ function normalizeRole(value) {
   return "";
 }
 
-function flattenLookup(value) {
-  if (value === null || value === undefined) return [];
-
-  if (!Array.isArray(value)) return [value];
-
-  const out = [];
-  for (const item of value) {
-    if (item === null || item === undefined) {
-      out.push("");
-    } else if (typeof item === "object") {
-      if ("name" in item) out.push(item.name ?? "");
-      else if ("text" in item) out.push(item.text ?? "");
-      else out.push(String(item));
-    } else {
-      out.push(item);
-    }
-  }
-  return out;
-}
-
 function coerceString(value) {
   if (value === null || value === undefined) return "";
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "";
+    return coerceString(value[0]);
+  }
   if (typeof value === "object") {
     if ("name" in value) return String(value.name ?? "");
     if ("text" in value) return String(value.text ?? "");
@@ -131,10 +117,11 @@ function pickHigherPriority(existing, incoming) {
 
 async function main() {
   console.log("TBB-1-OptInMerge-v1.0.26");
-  output.text("Loading tables...");
+  output.text("Loading records...");
 
   const finalsRosterTable = base.getTable(CONFIG.finalsRosterTableName);
   const competitorTable = base.getTable(CONFIG.competitorProfilesTableName);
+  const parentCoachTable = base.getTable(CONFIG.parentCoachProfilesTableName);
   const stagingTable = base.getTable(CONFIG.stagingTableName);
 
   const finalsRosterQuery = await finalsRosterTable.selectRecordsAsync({
@@ -143,14 +130,19 @@ async function main() {
 
   const competitorQuery = await competitorTable.selectRecordsAsync({
     fields: [
-      CONFIG.competitorFinalsRosterField,
       CONFIG.competitorNameField,
       CONFIG.competitorPhoneField,
       CONFIG.competitorOptInField,
-      CONFIG.parentCoachNamesLookupField,
-      CONFIG.parentCoachPhonesLookupField,
-      CONFIG.parentCoachRolesLookupField,
-      CONFIG.parentCoachOptInLookupField,
+      CONFIG.competitorParentCoachLinkField,
+    ],
+  });
+
+  const parentCoachQuery = await parentCoachTable.selectRecordsAsync({
+    fields: [
+      CONFIG.parentCoachNameField,
+      CONFIG.parentCoachPhoneField,
+      CONFIG.parentCoachRoleField,
+      CONFIG.parentCoachOptInField,
     ],
   });
 
@@ -170,6 +162,11 @@ async function main() {
   }
 
   console.log(`Finals-linked Competitor Profiles found: ${finalsCompetitorIds.size}`);
+
+  const parentCoachById = new Map();
+  for (const record of parentCoachQuery.records) {
+    parentCoachById.set(record.id, record);
+  }
 
   const desiredByPhone = new Map();
 
@@ -203,37 +200,32 @@ async function main() {
       );
     }
 
-    const parentNames = flattenLookup(
-      competitorRecord.getCellValue(CONFIG.parentCoachNamesLookupField)
-    );
-    const parentPhones = flattenLookup(
-      competitorRecord.getCellValue(CONFIG.parentCoachPhonesLookupField)
-    );
-    const parentRoles = flattenLookup(
-      competitorRecord.getCellValue(CONFIG.parentCoachRolesLookupField)
-    );
-    const parentOptIns = flattenLookup(
-      competitorRecord.getCellValue(CONFIG.parentCoachOptInLookupField)
-    );
+    const linkedParentCoach = competitorRecord.getCellValue(CONFIG.competitorParentCoachLinkField) || [];
 
-    const maxLen = Math.max(
-      parentNames.length,
-      parentPhones.length,
-      parentRoles.length,
-      parentOptIns.length
-    );
+    for (const linked of linkedParentCoach) {
+      if (!linked?.id) continue;
 
-    for (let i = 0; i < maxLen; i++) {
-      const optIn = normalizeOptIn(parentOptIns[i]);
+      const parentCoachRecord = parentCoachById.get(linked.id);
+      if (!parentCoachRecord) continue;
+
+      const optIn = normalizeOptIn(
+        parentCoachRecord.getCellValue(CONFIG.parentCoachOptInField)
+      );
       if (!optIn) continue;
 
-      const role = normalizeRole(parentRoles[i]);
+      const role = normalizeRole(
+        parentCoachRecord.getCellValue(CONFIG.parentCoachRoleField)
+      );
       if (!role) continue;
 
-      const phone = normalizePhone(parentPhones[i]);
+      const phone = normalizePhone(
+        parentCoachRecord.getCellValue(CONFIG.parentCoachPhoneField)
+      );
       if (!phone) continue;
 
-      const name = coerceString(parentNames[i]).trim();
+      const name = coerceString(
+        parentCoachRecord.getCellValue(CONFIG.parentCoachNameField)
+      ).trim();
 
       const candidate = {
         uniqueKey: phone,
@@ -241,7 +233,7 @@ async function main() {
         phone,
         affiliation: role,
         source: "FINALS ROSTER",
-        sourceRecordId: `${competitorRecord.id}::${role}::${i}`,
+        sourceRecordId: parentCoachRecord.id,
         active: true,
       };
 
