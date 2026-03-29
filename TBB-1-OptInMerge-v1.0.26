@@ -1,0 +1,326 @@
+/**
+ * TBB-1-OptInMerge-v1.0.26
+ * Build/refresh Finals Text Blast Build staging table from Finals-eligible opted-in records
+ *
+ * BEHAVIOR:
+ * - Reads Finals Roster and finds linked Competitor Profiles
+ * - Includes competitor if:
+ *      {Text Alerts OPT IN} == YES
+ * - Includes linked parent/coach entries if lookup arrays indicate:
+ *      {Parent/Coach Text Alerts OPT IN} == YES
+ * - Dedupe key is normalized phone number
+ * - Within this staging table, affiliation priority is:
+ *      COMPETITOR > PARENT > COACH
+ * - Upserts qualified records into {Finals Text Blast Build}
+ * - Deletes staging records that no longer qualify
+ *
+ * BUG FIXES:
+ * - N/A
+ */
+
+const CONFIG = {
+  finalsRosterTableName: "Finals Roster",
+  competitorProfilesTableName: "Competitor Profiles",
+  stagingTableName: "Finals Text Blast Build",
+
+  finalsRosterToCompetitorField: "Competitor Profile",
+
+  competitorFinalsRosterField: "Finals Roster",
+  competitorNameField: "Full Name",
+  competitorPhoneField: "Competitor Phone Number",
+  competitorOptInField: "Text Alerts OPT IN",
+
+  parentCoachNamesLookupField: "Parent/Coach Full Name",
+  parentCoachPhonesLookupField: "Parent/Coach Phone Number",
+  parentCoachRolesLookupField: "Parent/Coach Role",
+  parentCoachOptInLookupField: "Parent/Coach Text Alerts OPT IN",
+
+  stagingFields: {
+    name: "Name",
+    phone: "Phone Number",
+    affiliation: "Affiliation",
+    source: "Source",
+    sourceRecordId: "Source Record ID",
+    uniqueKey: "Unique Key",
+    active: "Active",
+  },
+};
+
+const PRIORITY = {
+  COMPETITOR: 3,
+  PARENT: 2,
+  COACH: 1,
+};
+
+function normalizePhone(value) {
+  if (!value) return "";
+  const digits = String(value).replace(/\D/g, "");
+  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
+  return digits;
+}
+
+function normalizeOptIn(value) {
+  if (value === null || value === undefined) return false;
+
+  if (Array.isArray(value)) {
+    return value.some(v => normalizeOptIn(v));
+  }
+
+  const str = String(value).trim().toUpperCase();
+  return ["YES", "TRUE", "1", "CHECKED"].includes(str);
+}
+
+function normalizeRole(value) {
+  const str = String(value || "").trim().toUpperCase();
+  if (str.includes("PARENT")) return "PARENT";
+  if (str.includes("COACH")) return "COACH";
+  return "";
+}
+
+function flattenLookup(value) {
+  if (value === null || value === undefined) return [];
+
+  if (!Array.isArray(value)) return [value];
+
+  const out = [];
+  for (const item of value) {
+    if (item === null || item === undefined) {
+      out.push("");
+    } else if (typeof item === "object") {
+      if ("name" in item) out.push(item.name ?? "");
+      else if ("text" in item) out.push(item.text ?? "");
+      else out.push(String(item));
+    } else {
+      out.push(item);
+    }
+  }
+  return out;
+}
+
+function coerceString(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "object") {
+    if ("name" in value) return String(value.name ?? "");
+    if ("text" in value) return String(value.text ?? "");
+  }
+  return String(value);
+}
+
+function batchRecords(records, size = 50) {
+  const out = [];
+  for (let i = 0; i < records.length; i += size) {
+    out.push(records.slice(i, i + size));
+  }
+  return out;
+}
+
+function pickHigherPriority(existing, incoming) {
+  if (!existing) return incoming;
+
+  const existingPriority = PRIORITY[existing.affiliation] ?? 0;
+  const incomingPriority = PRIORITY[incoming.affiliation] ?? 0;
+
+  if (incomingPriority > existingPriority) return incoming;
+
+  if (incomingPriority === existingPriority) {
+    if ((!existing.name || !existing.name.trim()) && incoming.name?.trim()) return incoming;
+  }
+
+  return existing;
+}
+
+async function main() {
+  console.log("TBB-1-OptInMerge-v1.0.26");
+  output.text("Loading tables...");
+
+  const finalsRosterTable = base.getTable(CONFIG.finalsRosterTableName);
+  const competitorTable = base.getTable(CONFIG.competitorProfilesTableName);
+  const stagingTable = base.getTable(CONFIG.stagingTableName);
+
+  const finalsRosterQuery = await finalsRosterTable.selectRecordsAsync({
+    fields: [CONFIG.finalsRosterToCompetitorField],
+  });
+
+  const competitorQuery = await competitorTable.selectRecordsAsync({
+    fields: [
+      CONFIG.competitorFinalsRosterField,
+      CONFIG.competitorNameField,
+      CONFIG.competitorPhoneField,
+      CONFIG.competitorOptInField,
+      CONFIG.parentCoachNamesLookupField,
+      CONFIG.parentCoachPhonesLookupField,
+      CONFIG.parentCoachRolesLookupField,
+      CONFIG.parentCoachOptInLookupField,
+    ],
+  });
+
+  const stagingQuery = await stagingTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.stagingFields),
+  });
+
+  console.log("Records loaded.");
+
+  const finalsCompetitorIds = new Set();
+
+  for (const record of finalsRosterQuery.records) {
+    const linkedCompetitors = record.getCellValue(CONFIG.finalsRosterToCompetitorField) || [];
+    for (const linked of linkedCompetitors) {
+      if (linked?.id) finalsCompetitorIds.add(linked.id);
+    }
+  }
+
+  console.log(`Finals-linked Competitor Profiles found: ${finalsCompetitorIds.size}`);
+
+  const desiredByPhone = new Map();
+
+  for (const competitorRecord of competitorQuery.records) {
+    if (!finalsCompetitorIds.has(competitorRecord.id)) continue;
+
+    const competitorOptIn = normalizeOptIn(
+      competitorRecord.getCellValue(CONFIG.competitorOptInField)
+    );
+    const competitorName = coerceString(
+      competitorRecord.getCellValue(CONFIG.competitorNameField)
+    ).trim();
+    const competitorPhone = normalizePhone(
+      competitorRecord.getCellValue(CONFIG.competitorPhoneField)
+    );
+
+    if (competitorOptIn && competitorPhone) {
+      const candidate = {
+        uniqueKey: competitorPhone,
+        name: competitorName,
+        phone: competitorPhone,
+        affiliation: "COMPETITOR",
+        source: "FINALS ROSTER",
+        sourceRecordId: competitorRecord.id,
+        active: true,
+      };
+
+      desiredByPhone.set(
+        competitorPhone,
+        pickHigherPriority(desiredByPhone.get(competitorPhone), candidate)
+      );
+    }
+
+    const parentNames = flattenLookup(
+      competitorRecord.getCellValue(CONFIG.parentCoachNamesLookupField)
+    );
+    const parentPhones = flattenLookup(
+      competitorRecord.getCellValue(CONFIG.parentCoachPhonesLookupField)
+    );
+    const parentRoles = flattenLookup(
+      competitorRecord.getCellValue(CONFIG.parentCoachRolesLookupField)
+    );
+    const parentOptIns = flattenLookup(
+      competitorRecord.getCellValue(CONFIG.parentCoachOptInLookupField)
+    );
+
+    const maxLen = Math.max(
+      parentNames.length,
+      parentPhones.length,
+      parentRoles.length,
+      parentOptIns.length
+    );
+
+    for (let i = 0; i < maxLen; i++) {
+      const optIn = normalizeOptIn(parentOptIns[i]);
+      if (!optIn) continue;
+
+      const role = normalizeRole(parentRoles[i]);
+      if (!role) continue;
+
+      const phone = normalizePhone(parentPhones[i]);
+      if (!phone) continue;
+
+      const name = coerceString(parentNames[i]).trim();
+
+      const candidate = {
+        uniqueKey: phone,
+        name,
+        phone,
+        affiliation: role,
+        source: "FINALS ROSTER",
+        sourceRecordId: `${competitorRecord.id}::${role}::${i}`,
+        active: true,
+      };
+
+      desiredByPhone.set(
+        phone,
+        pickHigherPriority(desiredByPhone.get(phone), candidate)
+      );
+    }
+  }
+
+  console.log(`Qualified staging records to build: ${desiredByPhone.size}`);
+
+  const existingByPhone = new Map();
+
+  for (const record of stagingQuery.records) {
+    const phone = normalizePhone(record.getCellValue(CONFIG.stagingFields.phone));
+    const uniqueKey = coerceString(record.getCellValue(CONFIG.stagingFields.uniqueKey)).trim();
+    const key = uniqueKey || phone;
+    if (key) existingByPhone.set(key, record);
+  }
+
+  const creates = [];
+  const updates = [];
+  const keepIds = new Set();
+
+  for (const [phone, desired] of desiredByPhone.entries()) {
+    const existing = existingByPhone.get(phone);
+
+    const fields = {};
+    fields[CONFIG.stagingFields.name] = desired.name;
+    fields[CONFIG.stagingFields.phone] = desired.phone;
+    fields[CONFIG.stagingFields.affiliation] = { name: desired.affiliation };
+    fields[CONFIG.stagingFields.source] = { name: desired.source };
+    fields[CONFIG.stagingFields.sourceRecordId] = desired.sourceRecordId;
+    fields[CONFIG.stagingFields.uniqueKey] = desired.uniqueKey;
+    fields[CONFIG.stagingFields.active] = desired.active;
+
+    if (existing) {
+      keepIds.add(existing.id);
+      updates.push({ id: existing.id, fields });
+    } else {
+      creates.push({ fields });
+    }
+  }
+
+  const deletes = [];
+
+  for (const record of stagingQuery.records) {
+    const phone = normalizePhone(record.getCellValue(CONFIG.stagingFields.phone));
+    const uniqueKey = coerceString(record.getCellValue(CONFIG.stagingFields.uniqueKey)).trim();
+    const key = uniqueKey || phone;
+
+    if (!key) {
+      deletes.push(record.id);
+      continue;
+    }
+
+    if (!desiredByPhone.has(key) && !keepIds.has(record.id)) {
+      deletes.push(record.id);
+    }
+  }
+
+  console.log(`Creating ${creates.length} record(s)...`);
+  for (const chunk of batchRecords(creates)) {
+    await stagingTable.createRecordsAsync(chunk);
+  }
+
+  console.log(`Updating ${updates.length} record(s)...`);
+  for (const chunk of batchRecords(updates)) {
+    await stagingTable.updateRecordsAsync(chunk);
+  }
+
+  console.log(`Deleting ${deletes.length} record(s)...`);
+  for (const chunk of batchRecords(deletes)) {
+    await stagingTable.deleteRecordsAsync(chunk);
+  }
+
+  output.markdown("### Done");
+  output.text(`Final staging total: ${desiredByPhone.size}`);
+}
+
+await main();
