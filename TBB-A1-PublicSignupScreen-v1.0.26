@@ -1,0 +1,87 @@
+/**
+ * TBB-A1-PublicSignupScreen-v1.0.26
+ * Screen TEXT PUB SIGNUPS records for eligibility before downstream add-to-TEXT ALERTS automation
+ *
+ * BEHAVIOR:
+ * - Runs on one TEXT PUB SIGNUPS record
+ * - Rejects affiliations:
+ *      COMPETITOR
+ *      PARENT
+ *      COACH
+ * - Accepts all other affiliations and marks them READY TO ADD
+ * - Normalizes phone number
+ * - Writes only status fields in TEXT PUB SIGNUPS
+ *
+ * BUG FIXES:
+ * - N/A
+ */
+
+const CONFIG = {
+  tableName: "TEXT PUB SIGNUPS",
+
+  inputRecordIdVar: "recordId",
+
+  fields: {
+    name: "Name",
+    phone: "Phone Number",
+    affiliation: "Affiliation",
+    processingStatus: "Processing Status",
+    normalizedPhone: "Normalized Phone",
+    processingNotes: "Processing Notes",
+  },
+};
+
+function normalizePhone(value) {
+  if (!value) return "";
+  const digits = String(value).replace(/\D/g, "");
+  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
+  return digits;
+}
+
+function getSingleSelectName(value) {
+  if (!value) return "";
+  if (typeof value === "object" && "name" in value) return String(value.name ?? "");
+  return String(value);
+}
+
+async function main() {
+  const { recordId } = input.config();
+  if (!recordId) throw new Error("Missing input variable: recordId");
+
+  const table = base.getTable(CONFIG.tableName);
+  const query = await table.selectRecordsAsync({
+    fields: Object.values(CONFIG.fields),
+  });
+
+  const record = query.getRecord(recordId);
+  if (!record) throw new Error(`Record not found: ${recordId}`);
+
+  const rawPhone = record.getCellValue(CONFIG.fields.phone);
+  const normalizedPhone = normalizePhone(rawPhone);
+  const rawAffiliation = getSingleSelectName(record.getCellValue(CONFIG.fields.affiliation)).trim().toUpperCase();
+
+  let status = "ERROR";
+  let notes = "";
+
+  if (!rawPhone) {
+    status = "SKIPPED - NO PHONE";
+    notes = "No phone number provided.";
+  } else if (normalizedPhone.length !== 10) {
+    status = "SKIPPED - BAD PHONE";
+    notes = `Phone could not be normalized to 10 digits. Raw value: ${rawPhone}`;
+  } else if (["COMPETITOR", "PARENT", "COACH"].includes(rawAffiliation)) {
+    status = "REJECTED - AFFILIATED STAKEHOLDER";
+    notes = `Affiliation ${rawAffiliation} must use the affiliated stakeholder opt-in flow, not the public signup form.`;
+  } else {
+    status = "READY TO ADD";
+    notes = `Eligible public signup. Downstream automation should add/update TEXT ALERTS as OTHER.`;
+  }
+
+  await table.updateRecordAsync(recordId, {
+    [CONFIG.fields.processingStatus]: { name: status },
+    [CONFIG.fields.normalizedPhone]: normalizedPhone,
+    [CONFIG.fields.processingNotes]: notes,
+  });
+}
+
+await main();
