@@ -1,21 +1,17 @@
 /**
  * TBB-2-ContactSheetMerge-v1.0.26
- * Merge all Finals text-alert sources into TEXT ALERTS
+ * Merge synced text opt-ins and CONTACT SHEET staff/jury into TEXT ALERTS
  *
  * BEHAVIOR:
  * - Reads synced opt-in staging table: {TEXT OPT INS}
  * - Reads {CONTACT SHEET} and includes only:
  *      {Category} == "ADC|IBC STAFF"  -> STAFF
  *      {Category} == "JURY"           -> JURY
- * - Reads {TEXT PUB SIGNUPS}
- * - Public signup records with affiliation:
- *      COMPETITOR, PARENT, COACH
- *   are excluded from TEXT ALERTS
  * - Dedupe key is normalized phone number
  * - Final affiliation priority is:
- *      JURY > STAFF > COMPETITOR > PARENT > COACH > OTHER
+ *      JURY > STAFF > COMPETITOR > PARENT > COACH
  * - Upserts qualified records into {TEXT ALERTS}
- * - Deletes TEXT ALERTS records no longer present in any source
+ * - Deletes TEXT ALERTS records no longer present in either source
  *
  * BUG FIXES:
  * - N/A
@@ -24,7 +20,6 @@
 const CONFIG = {
   syncedStagingTableName: "TEXT OPT INS",
   contactSheetTableName: "CONTACT SHEET",
-  publicSignupTableName: "TEXT PUB SIGNUPS",
   finalTableName: "TEXT ALERTS",
 
   syncedFields: {
@@ -43,12 +38,6 @@ const CONFIG = {
     category: "Category",
   },
 
-  publicFields: {
-    name: "Name",
-    phone: "Phone number",
-    affiliation: "Affiliation",
-  },
-
   finalFields: {
     name: "Name",
     phone: "Phone Number",
@@ -61,12 +50,11 @@ const CONFIG = {
 };
 
 const PRIORITY = {
-  JURY: 6,
-  STAFF: 5,
-  COMPETITOR: 4,
-  PARENT: 3,
-  COACH: 2,
-  OTHER: 1,
+  JURY: 5,
+  STAFF: 4,
+  COMPETITOR: 3,
+  PARENT: 2,
+  COACH: 1,
 };
 
 function normalizePhone(value) {
@@ -113,7 +101,6 @@ function pickHigherPriority(existing, incoming) {
   if (incomingPriority > existingPriority) return incoming;
 
   if (incomingPriority === existingPriority) {
-    if (existing.source === "PUBLIC SIGNUP" && incoming.source !== "PUBLIC SIGNUP") return incoming;
     if ((!existing.name || !existing.name.trim()) && incoming.name?.trim()) return incoming;
   }
 
@@ -127,20 +114,12 @@ function mapContactCategoryToAffiliation(category) {
   return "";
 }
 
-function normalizePublicAffiliation(value) {
-  const aff = String(value || "").trim().toUpperCase();
-  if (["OTHER", "JURY", "STAFF"].includes(aff)) return aff;
-  if (["COMPETITOR", "PARENT", "COACH"].includes(aff)) return aff;
-  return "OTHER";
-}
-
 async function main() {
   console.log("TBB-2-ContactSheetMerge-v1.0.26");
-  output.text("Loading tables...");
+  output.text("Loading records...");
 
   const syncedTable = base.getTable(CONFIG.syncedStagingTableName);
   const contactTable = base.getTable(CONFIG.contactSheetTableName);
-  const publicTable = base.getTable(CONFIG.publicSignupTableName);
   const finalTable = base.getTable(CONFIG.finalTableName);
 
   const syncedQuery = await syncedTable.selectRecordsAsync({
@@ -149,10 +128,6 @@ async function main() {
 
   const contactQuery = await contactTable.selectRecordsAsync({
     fields: Object.values(CONFIG.contactFields),
-  });
-
-  const publicQuery = await publicTable.selectRecordsAsync({
-    fields: Object.values(CONFIG.publicFields),
   });
 
   const finalQuery = await finalTable.selectRecordsAsync({
@@ -212,40 +187,7 @@ async function main() {
     );
   }
 
-  let excludedPublicAffiliationCount = 0;
-
-  for (const record of publicQuery.records) {
-    const phone = normalizePhone(record.getCellValue(CONFIG.publicFields.phone));
-    if (!phone) continue;
-
-    const rawAffiliation = getSingleSelectName(
-      record.getCellValue(CONFIG.publicFields.affiliation)
-    );
-    const affiliation = normalizePublicAffiliation(rawAffiliation);
-
-    if (["COMPETITOR", "PARENT", "COACH"].includes(affiliation)) {
-      excludedPublicAffiliationCount++;
-      continue;
-    }
-
-    const candidate = {
-      uniqueKey: phone,
-      name: coerceString(record.getCellValue(CONFIG.publicFields.name)).trim(),
-      phone,
-      affiliation,
-      source: "PUBLIC SIGNUP",
-      sourceRecordId: record.id,
-      active: true,
-    };
-
-    desiredByPhone.set(
-      phone,
-      pickHigherPriority(desiredByPhone.get(phone), candidate)
-    );
-  }
-
   console.log(`Merged qualified unique phones: ${desiredByPhone.size}`);
-  console.log(`Excluded public signups due to affiliated-role selection: ${excludedPublicAffiliationCount}`);
 
   const existingByPhone = new Map();
 
