@@ -1,0 +1,170 @@
+/**
+ * TBB-A3-CompetitorOptInUpsert-v1.0.26
+ * Upsert a Finals competitor into Finals Text Blast Build from a Profile Updates record
+ *
+ * BEHAVIOR:
+ * - Runs on one {Profile Updates} record
+ * - Reads linked {Competitor Profile}
+ * - Uses {Text Alerts OPT IN} and {Updated Personal Phone Number} from the Profile Updates record
+ * - Confirms linked competitor is a finalist by checking {Finals Roster} on {Competitor Profiles}
+ * - If finalist + opted in + valid phone:
+ *      upserts competitor into {Finals Text Blast Build}
+ * - If not qualified:
+ *      removes matching staging record only if it belongs to that competitor source record
+ *
+ * BUG FIXES:
+ * - N/A
+ */
+
+const CONFIG = {
+  profileUpdatesTableName: "Profile Updates",
+  competitorProfilesTableName: "Competitor Profiles",
+  stagingTableName: "Finals Text Blast Build",
+
+  inputRecordIdVar: "recordId",
+
+  profileUpdatesFields: {
+    competitorProfile: "Competitor Profile",
+    optIn: "Text Alerts OPT IN",
+    updatedPhone: "Updated Personal Phone Number",
+  },
+
+  competitorFields: {
+    finalsRoster: "Finals Roster",
+    fullName: "Full Name",
+  },
+
+  stagingFields: {
+    name: "Name",
+    phone: "Phone Number",
+    affiliation: "Affiliation",
+    source: "Source",
+    sourceRecordId: "Source Record ID",
+    uniqueKey: "Unique Key",
+    active: "Active",
+  },
+};
+
+function normalizePhone(value) {
+  if (!value) return "";
+  const digits = String(value).replace(/\D/g, "");
+  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
+  return digits;
+}
+
+function normalizeOptIn(value) {
+  if (value === null || value === undefined) return false;
+
+  if (Array.isArray(value)) {
+    return value.some(v => normalizeOptIn(v));
+  }
+
+  if (typeof value === "object") {
+    if ("name" in value) return String(value.name ?? "").trim().toUpperCase() === "YES";
+    if ("text" in value) return String(value.text ?? "").trim().toUpperCase() === "YES";
+  }
+
+  const str = String(value).trim().toUpperCase();
+  return ["YES", "TRUE", "1", "CHECKED"].includes(str);
+}
+
+function coerceString(value) {
+  if (value === null || value === undefined) return "";
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "";
+    return coerceString(value[0]);
+  }
+  if (typeof value === "object") {
+    if ("name" in value) return String(value.name ?? "");
+    if ("text" in value) return String(value.text ?? "");
+  }
+  return String(value);
+}
+
+async function main() {
+  console.log("TBB-A3-CompetitorOptInUpsert-v1.0.26");
+
+  const { recordId } = input.config();
+  if (!recordId) throw new Error("Missing input variable: recordId");
+
+  const profileUpdatesTable = base.getTable(CONFIG.profileUpdatesTableName);
+  const competitorTable = base.getTable(CONFIG.competitorProfilesTableName);
+  const stagingTable = base.getTable(CONFIG.stagingTableName);
+
+  const profileUpdatesQuery = await profileUpdatesTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.profileUpdatesFields),
+  });
+
+  const competitorQuery = await competitorTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.competitorFields),
+  });
+
+  const stagingQuery = await stagingTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.stagingFields),
+  });
+
+  const updateRecord = profileUpdatesQuery.getRecord(recordId);
+  if (!updateRecord) throw new Error(`Profile Updates record not found: ${recordId}`);
+
+  const linkedCompetitors = updateRecord.getCellValue(CONFIG.profileUpdatesFields.competitorProfile) || [];
+  if (linkedCompetitors.length === 0) {
+    console.log("No linked Competitor Profile on Profile Updates record.");
+    return;
+  }
+
+  const competitorId = linkedCompetitors[0].id;
+  const competitorRecord = competitorQuery.getRecord(competitorId);
+  if (!competitorRecord) {
+    console.log("Linked Competitor Profile record not found.");
+    return;
+  }
+
+  const finalsRosterLinks = competitorRecord.getCellValue(CONFIG.competitorFields.finalsRoster) || [];
+  const isFinalist = finalsRosterLinks.length > 0;
+
+  const optedIn = normalizeOptIn(updateRecord.getCellValue(CONFIG.profileUpdatesFields.optIn));
+  const phone = normalizePhone(updateRecord.getCellValue(CONFIG.profileUpdatesFields.updatedPhone));
+  const name = coerceString(competitorRecord.getCellValue(CONFIG.competitorFields.fullName)).trim();
+
+  const sourceRecordId = competitorRecord.id;
+  const source = "FINALS ROSTER";
+
+  let existing = null;
+  for (const rec of stagingQuery.records) {
+    const recSourceId = coerceString(rec.getCellValue(CONFIG.stagingFields.sourceRecordId)).trim();
+    const recAffiliation = coerceString(rec.getCellValue(CONFIG.stagingFields.affiliation)?.name || rec.getCellValue(CONFIG.stagingFields.affiliation)).trim().toUpperCase();
+    if (recSourceId === sourceRecordId && recAffiliation === "COMPETITOR") {
+      existing = rec;
+      break;
+    }
+  }
+
+  if (isFinalist && optedIn && phone.length === 10) {
+    const fields = {
+      [CONFIG.stagingFields.name]: name,
+      [CONFIG.stagingFields.phone]: phone,
+      [CONFIG.stagingFields.affiliation]: { name: "COMPETITOR" },
+      [CONFIG.stagingFields.source]: { name: source },
+      [CONFIG.stagingFields.sourceRecordId]: sourceRecordId,
+      [CONFIG.stagingFields.uniqueKey]: phone,
+      [CONFIG.stagingFields.active]: true,
+    };
+
+    if (existing) {
+      await stagingTable.updateRecordAsync(existing.id, fields);
+      console.log(`Updated competitor staging record for ${name}`);
+    } else {
+      await stagingTable.createRecordAsync(fields);
+      console.log(`Created competitor staging record for ${name}`);
+    }
+  } else {
+    if (existing) {
+      await stagingTable.deleteRecordAsync(existing.id);
+      console.log(`Deleted competitor staging record for ${name} because they no longer qualify.`);
+    } else {
+      console.log("Competitor does not qualify and no existing staging record needed deletion.");
+    }
+  }
+}
+
+await main();
