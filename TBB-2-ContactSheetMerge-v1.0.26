@@ -1,0 +1,319 @@
+/**
+ * TBB-2-ContactSheetMerge-v1.0.26
+ * Merge all Finals text-alert sources into TEXT ALERTS
+ *
+ * BEHAVIOR:
+ * - Reads synced opt-in staging table: {TEXT OPT INS}
+ * - Reads {CONTACT SHEET} and includes only:
+ *      {Category} == "ADC|IBC STAFF"  -> STAFF
+ *      {Category} == "JURY"           -> JURY
+ * - Reads {TEXT PUB SIGNUPS}
+ * - Public signup records with affiliation:
+ *      COMPETITOR, PARENT, COACH
+ *   are excluded from TEXT ALERTS
+ * - Dedupe key is normalized phone number
+ * - Final affiliation priority is:
+ *      JURY > STAFF > COMPETITOR > PARENT > COACH > OTHER
+ * - Upserts qualified records into {TEXT ALERTS}
+ * - Deletes TEXT ALERTS records no longer present in any source
+ *
+ * BUG FIXES:
+ * - N/A
+ */
+
+const CONFIG = {
+  syncedStagingTableName: "TEXT OPT INS",
+  contactSheetTableName: "CONTACT SHEET",
+  publicSignupTableName: "TEXT PUB SIGNUPS",
+  finalTableName: "TEXT ALERTS",
+
+  syncedFields: {
+    name: "Name",
+    phone: "Phone Number",
+    affiliation: "Affiliation",
+    source: "Source",
+    sourceRecordId: "Source Record ID",
+    uniqueKey: "Unique Key",
+    active: "Active",
+  },
+
+  contactFields: {
+    name: "Name",
+    phone: "Phone Number",
+    category: "Category",
+  },
+
+  publicFields: {
+    name: "Name",
+    phone: "Phone number",
+    affiliation: "Affiliation",
+  },
+
+  finalFields: {
+    name: "Name",
+    phone: "Phone Number",
+    affiliation: "Affiliation",
+    source: "Source",
+    sourceRecordId: "Source Record ID",
+    uniqueKey: "Unique Key",
+    active: "Active",
+  },
+};
+
+const PRIORITY = {
+  JURY: 6,
+  STAFF: 5,
+  COMPETITOR: 4,
+  PARENT: 3,
+  COACH: 2,
+  OTHER: 1,
+};
+
+function normalizePhone(value) {
+  if (!value) return "";
+  const digits = String(value).replace(/\D/g, "");
+  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
+  return digits;
+}
+
+function coerceString(value) {
+  if (value === null || value === undefined) return "";
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "";
+    return coerceString(value[0]);
+  }
+  if (typeof value === "object") {
+    if ("name" in value) return String(value.name ?? "");
+    if ("text" in value) return String(value.text ?? "");
+  }
+  return String(value);
+}
+
+function getSingleSelectName(value) {
+  if (!value) return "";
+  if (Array.isArray(value)) return getSingleSelectName(value[0]);
+  if (typeof value === "object" && "name" in value) return String(value.name ?? "");
+  return String(value);
+}
+
+function batchRecords(records, size = 50) {
+  const out = [];
+  for (let i = 0; i < records.length; i += size) {
+    out.push(records.slice(i, i + size));
+  }
+  return out;
+}
+
+function pickHigherPriority(existing, incoming) {
+  if (!existing) return incoming;
+
+  const existingPriority = PRIORITY[existing.affiliation] ?? 0;
+  const incomingPriority = PRIORITY[incoming.affiliation] ?? 0;
+
+  if (incomingPriority > existingPriority) return incoming;
+
+  if (incomingPriority === existingPriority) {
+    if (existing.source === "PUBLIC SIGNUP" && incoming.source !== "PUBLIC SIGNUP") return incoming;
+    if ((!existing.name || !existing.name.trim()) && incoming.name?.trim()) return incoming;
+  }
+
+  return existing;
+}
+
+function mapContactCategoryToAffiliation(category) {
+  const cat = String(category || "").trim().toUpperCase();
+  if (cat === "ADC|IBC STAFF") return "STAFF";
+  if (cat === "JURY") return "JURY";
+  return "";
+}
+
+function normalizePublicAffiliation(value) {
+  const aff = String(value || "").trim().toUpperCase();
+  if (["OTHER", "JURY", "STAFF"].includes(aff)) return aff;
+  if (["COMPETITOR", "PARENT", "COACH"].includes(aff)) return aff;
+  return "OTHER";
+}
+
+async function main() {
+  console.log("TBB-2-ContactSheetMerge-v1.0.26");
+  output.text("Loading tables...");
+
+  const syncedTable = base.getTable(CONFIG.syncedStagingTableName);
+  const contactTable = base.getTable(CONFIG.contactSheetTableName);
+  const publicTable = base.getTable(CONFIG.publicSignupTableName);
+  const finalTable = base.getTable(CONFIG.finalTableName);
+
+  const syncedQuery = await syncedTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.syncedFields),
+  });
+
+  const contactQuery = await contactTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.contactFields),
+  });
+
+  const publicQuery = await publicTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.publicFields),
+  });
+
+  const finalQuery = await finalTable.selectRecordsAsync({
+    fields: Object.values(CONFIG.finalFields),
+  });
+
+  console.log("Records loaded.");
+
+  const desiredByPhone = new Map();
+
+  for (const record of syncedQuery.records) {
+    const phone = normalizePhone(record.getCellValue(CONFIG.syncedFields.phone));
+    if (!phone) continue;
+
+    const affiliation = getSingleSelectName(
+      record.getCellValue(CONFIG.syncedFields.affiliation)
+    ).trim().toUpperCase();
+    if (!affiliation) continue;
+
+    const candidate = {
+      uniqueKey: phone,
+      name: coerceString(record.getCellValue(CONFIG.syncedFields.name)).trim(),
+      phone,
+      affiliation,
+      source: getSingleSelectName(record.getCellValue(CONFIG.syncedFields.source)) || "FINALS ROSTER",
+      sourceRecordId: coerceString(record.getCellValue(CONFIG.syncedFields.sourceRecordId)),
+      active: true,
+    };
+
+    desiredByPhone.set(
+      phone,
+      pickHigherPriority(desiredByPhone.get(phone), candidate)
+    );
+  }
+
+  for (const record of contactQuery.records) {
+    const category = coerceString(record.getCellValue(CONFIG.contactFields.category));
+    const affiliation = mapContactCategoryToAffiliation(category);
+    if (!affiliation) continue;
+
+    const phone = normalizePhone(record.getCellValue(CONFIG.contactFields.phone));
+    if (!phone) continue;
+
+    const candidate = {
+      uniqueKey: phone,
+      name: coerceString(record.getCellValue(CONFIG.contactFields.name)).trim(),
+      phone,
+      affiliation,
+      source: "CONTACT SHEET",
+      sourceRecordId: record.id,
+      active: true,
+    };
+
+    desiredByPhone.set(
+      phone,
+      pickHigherPriority(desiredByPhone.get(phone), candidate)
+    );
+  }
+
+  let excludedPublicAffiliationCount = 0;
+
+  for (const record of publicQuery.records) {
+    const phone = normalizePhone(record.getCellValue(CONFIG.publicFields.phone));
+    if (!phone) continue;
+
+    const rawAffiliation = getSingleSelectName(
+      record.getCellValue(CONFIG.publicFields.affiliation)
+    );
+    const affiliation = normalizePublicAffiliation(rawAffiliation);
+
+    if (["COMPETITOR", "PARENT", "COACH"].includes(affiliation)) {
+      excludedPublicAffiliationCount++;
+      continue;
+    }
+
+    const candidate = {
+      uniqueKey: phone,
+      name: coerceString(record.getCellValue(CONFIG.publicFields.name)).trim(),
+      phone,
+      affiliation,
+      source: "PUBLIC SIGNUP",
+      sourceRecordId: record.id,
+      active: true,
+    };
+
+    desiredByPhone.set(
+      phone,
+      pickHigherPriority(desiredByPhone.get(phone), candidate)
+    );
+  }
+
+  console.log(`Merged qualified unique phones: ${desiredByPhone.size}`);
+  console.log(`Excluded public signups due to affiliated-role selection: ${excludedPublicAffiliationCount}`);
+
+  const existingByPhone = new Map();
+
+  for (const record of finalQuery.records) {
+    const phone = normalizePhone(record.getCellValue(CONFIG.finalFields.phone));
+    const uniqueKey = coerceString(record.getCellValue(CONFIG.finalFields.uniqueKey)).trim();
+    const key = uniqueKey || phone;
+    if (key) existingByPhone.set(key, record);
+  }
+
+  const creates = [];
+  const updates = [];
+  const keepIds = new Set();
+
+  for (const [phone, desired] of desiredByPhone.entries()) {
+    const existing = existingByPhone.get(phone);
+
+    const fields = {};
+    fields[CONFIG.finalFields.name] = desired.name;
+    fields[CONFIG.finalFields.phone] = desired.phone;
+    fields[CONFIG.finalFields.affiliation] = { name: desired.affiliation };
+    fields[CONFIG.finalFields.source] = desired.source;
+    fields[CONFIG.finalFields.sourceRecordId] = desired.sourceRecordId;
+    fields[CONFIG.finalFields.uniqueKey] = desired.uniqueKey;
+    fields[CONFIG.finalFields.active] = desired.active;
+
+    if (existing) {
+      keepIds.add(existing.id);
+      updates.push({ id: existing.id, fields });
+    } else {
+      creates.push({ fields });
+    }
+  }
+
+  const deletes = [];
+
+  for (const record of finalQuery.records) {
+    const phone = normalizePhone(record.getCellValue(CONFIG.finalFields.phone));
+    const uniqueKey = coerceString(record.getCellValue(CONFIG.finalFields.uniqueKey)).trim();
+    const key = uniqueKey || phone;
+
+    if (!key) {
+      deletes.push(record.id);
+      continue;
+    }
+
+    if (!desiredByPhone.has(key) && !keepIds.has(record.id)) {
+      deletes.push(record.id);
+    }
+  }
+
+  console.log(`Creating ${creates.length} record(s)...`);
+  for (const chunk of batchRecords(creates)) {
+    await finalTable.createRecordsAsync(chunk);
+  }
+
+  console.log(`Updating ${updates.length} record(s)...`);
+  for (const chunk of batchRecords(updates)) {
+    await finalTable.updateRecordsAsync(chunk);
+  }
+
+  console.log(`Deleting ${deletes.length} record(s)...`);
+  for (const chunk of batchRecords(deletes)) {
+    await finalTable.deleteRecordsAsync(chunk);
+  }
+
+  output.markdown("### Done");
+  output.text(`Final TEXT ALERTS total: ${desiredByPhone.size}`);
+}
+
+await main();
