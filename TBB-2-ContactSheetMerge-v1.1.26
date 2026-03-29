@@ -1,11 +1,12 @@
 /**
- * TBB-2-ContactSheetMerge-v1.0.26
+ * TBB-2-ContactSheetMerge-v1.1.26
  * Merge synced text opt-ins and CONTACT SHEET staff/jury into TEXT ALERTS
  *
  * BEHAVIOR:
  * - Reads synced opt-in staging table: {TEXT OPT INS}
  * - Reads {CONTACT SHEET} and includes only:
  *      {Category} == "ADC|IBC STAFF"  -> STAFF
+ *      {Category} == "MEDIA STAFF"    -> STAFF
  *      {Category} == "JURY"           -> JURY
  * - Dedupe key is normalized phone number
  * - Final affiliation priority is:
@@ -14,7 +15,7 @@
  * - Deletes TEXT ALERTS records no longer present in either source
  *
  * BUG FIXES:
- * - N/A
+ * - Added CONTACT SHEET support for {Category} == "MEDIA STAFF"
  */
 
 const CONFIG = {
@@ -109,13 +110,16 @@ function pickHigherPriority(existing, incoming) {
 
 function mapContactCategoryToAffiliation(category) {
   const cat = String(category || "").trim().toUpperCase();
-  if (cat === "ADC|IBC STAFF") return "STAFF";
+
   if (cat === "JURY") return "JURY";
+  if (cat === "ADC|IBC STAFF") return "STAFF";
+  if (cat === "MEDIA STAFF") return "STAFF";
+
   return "";
 }
 
 async function main() {
-  console.log("TBB-2-ContactSheetMerge-v1.0.26");
+  console.log("TBB-2-ContactSheetMerge-v1.0.27");
   output.text("Loading records...");
 
   const syncedTable = base.getTable(CONFIG.syncedStagingTableName);
